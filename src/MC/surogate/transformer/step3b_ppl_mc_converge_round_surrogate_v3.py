@@ -3,6 +3,7 @@
 """
 Step 3b — Surrogate-guided Monte-Carlo Beam Search (Pre-baked, convergence)
 ============================================================================
+"이게 제일 성능 좋음 !!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 요구사항 반영 (v2 기반):
 - neighbor 생성(generate_random_neighbor) / budget projection(project_to_weighted_band/budget) 로직은 그대로 유지
 - 기존 "finalists 전부 실제 PPL 측정"을 변경:
@@ -15,9 +16,14 @@ Step 3b — Surrogate-guided Monte-Carlo Beam Search (Pre-baked, convergence)
 - surrogate score 캐시(LRU) + true PPL 캐시(LRU) 유지
 - init(초기 beam 구성)에서도 surrogate로 후보 랭킹 후 top-K만 true PPL 측정
 
-Usage 예시:
+[수정 사항 - 요청 반영]
+1) global best 변수 추가
+2) ppl_curve.csv에서 num_finalists / num_true_eval 저장 제거
+3) ppl_curve.csv에서 best_ppl 옆에 global_best_ppl 저장
+   - bit_assign.csv는 global best가 갱신될 때만 갱신(초기 1회 + 갱신 시만)
+   
 CUDA_VISIBLE_DEVICES=0 nohup \
-python montecarlo/step3b_ppl_mc_converge_round_surrogate_v2.py \
+python montecarlo/transformer/step3b_ppl_mc_converge_round_surrogate_v3.py \
   --model_id meta-llama/Llama-3.2-3B \
   --gpu_id 0 \
   --sens_csv ../artifacts/montecarlo/step1/layerwise_sensitivity.csv \
@@ -27,10 +33,10 @@ python montecarlo/step3b_ppl_mc_converge_round_surrogate_v2.py \
   --use_round_band --round_quantum 0.1 \
   --beam_size 10 --expansion_k 20 --filter_p 80 \
   --true_eval_topk 10 \
-  --surrogate_ckpt ../artifacts/surrogate_checkpoint_brp_50/best.pt \
-  --surrogate_config ../artifacts/surrogate_checkpoint_brp_50/config.json \
+  --surrogate_ckpt ../artifacts/surrogate_checkpoint_brp_3l/best.pt \
+  --surrogate_config ../artifacts/surrogate_checkpoint_brp_3l/config.json \
   --patience 12 --stable_bits_patience 12 \
-  --output_dir ../artifacts/montecarlo/step3b_surrogate_roundband > run.log 2>&1 &
+  --output_dir ../artifacts/montecarlo/step3b_surrogate_roundband_v3_3l > run_v3_layer3.log 2>&1 &
 """
 
 import os, gc, csv, json, math, random, argparse, re, time, sys
@@ -38,20 +44,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import OrderedDict
 from functools import reduce
-import operator
-
-# Ensure repo-relative modules (src/*, proxy_codes/*) can be imported even when
-# this script is executed from arbitrary working directories.
-_FILE_PATH = Path(__file__).resolve()
-_PARENTS = _FILE_PATH.parents
-_SRC_ROOT = _PARENTS[1] if len(_PARENTS) > 1 else _FILE_PATH.parent
-_REPO_ROOT = _PARENTS[2] if len(_PARENTS) > 2 else _SRC_ROOT
-_WORKSPACE_ROOT = _PARENTS[3] if len(_PARENTS) > 3 else _REPO_ROOT
-_PROJECT_ROOT = _WORKSPACE_ROOT.parent if _WORKSPACE_ROOT != _WORKSPACE_ROOT.parent else _WORKSPACE_ROOT
-for _path in (_SRC_ROOT, _REPO_ROOT, _WORKSPACE_ROOT, _PROJECT_ROOT):
-    _path_str = str(_path)
-    if _path_str not in sys.path:
-        sys.path.insert(0, _path_str)
 
 import torch
 import torch.nn as nn
@@ -61,11 +53,28 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import numpy as np
 
+# Ensure repo-relative modules (src/*, proxy_codes/*) can be imported even when
+# this script is executed from arbitrary working directories.
+_FILE_PATH = Path(__file__).resolve()
+_PARENTS = _FILE_PATH.parents
+_SRC_ROOT = _PARENTS[1] if len(_PARENTS) > 1 else _FILE_PATH.parent
+_REPO_ROOT = _PARENTS[2] if len(_PARENTS) > 2 else _SRC_ROOT
+_WORKSPACE_ROOT = _PARENTS[3] if len(_PARENTS) > 3 else _REPO_ROOT
+_PROJECT_ROOT = (
+    _WORKSPACE_ROOT.parent
+    if _WORKSPACE_ROOT != _WORKSPACE_ROOT.parent
+    else _WORKSPACE_ROOT
+)
+for _path in (_SRC_ROOT, _REPO_ROOT, _WORKSPACE_ROOT, _PROJECT_ROOT):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
+
 # -----------------------------------------------
 # Step 2/4에서 가져오기 (경로/네이밍)
 # -----------------------------------------------
 try:
-    from step2_alpha_estimation import _canonical_dataset_name
+    from step2_alpha_estimation import _canonical_dataset_name  # noqa: F401
 except ImportError:
     print("오류: step2_alpha_estimation.py가 같은 디렉토리에 필요합니다.")
     exit(1)
@@ -95,6 +104,17 @@ def _safe_name(s) -> str:
     if s.strip() == "" or s.strip().lower() == "none":
         s = "none"
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+def atomic_save_bit_assign_csv(path: str, bits: Dict[str, int]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["layer_name", "R_int"])
+        for name, bit in sorted(bits.items()):
+            w.writerow([name, int(bit)])
+    os.replace(tmp, path)
 
 
 @torch.no_grad()
@@ -168,7 +188,11 @@ def weighted_sum_bits(b_assign: Dict[str, int], W_map: Dict[str, int]) -> int:
 
 
 def gcd_list(int_list: List[int]) -> int:
-    return reduce(math.gcd, int_list) if len(int_list) > 1 else (int_list[0] if int_list else 1)
+    return (
+        reduce(math.gcd, int_list)
+        if len(int_list) > 1
+        else (int_list[0] if int_list else 1)
+    )
 
 
 def target_weighted_sum(avg_bits: float, W_map: Dict[str, int]) -> int:
@@ -180,7 +204,9 @@ def target_weighted_sum(avg_bits: float, W_map: Dict[str, int]) -> int:
     return snapped
 
 
-def ensure_complete_assignment(b_assign: Dict[str, int], layer_names: List[str], bmin: int) -> Dict[str, int]:
+def ensure_complete_assignment(
+    b_assign: Dict[str, int], layer_names: List[str], bmin: int
+) -> Dict[str, int]:
     out = dict(b_assign)
     for n in layer_names:
         if n not in out:
@@ -233,13 +259,17 @@ def project_to_weighted_budget(
             break
 
         if delta > 0:
-            cand = [(marg_gain_up(n) / float(W_map[n]), n) for n in names if b[n] < bmax]
+            cand = [
+                (marg_gain_up(n) / float(W_map[n]), n) for n in names if b[n] < bmax
+            ]
             if not cand:
                 break
             cand.sort(key=lambda x: x[0], reverse=True)
             b[cand[0][1]] += 1
         else:
-            cand = [(marg_harm_down(n) / float(W_map[n]), n) for n in names if b[n] > bmin]
+            cand = [
+                (marg_harm_down(n) / float(W_map[n]), n) for n in names if b[n] > bmin
+            ]
             if not cand:
                 break
             cand.sort(key=lambda x: x[0])
@@ -269,9 +299,13 @@ def project_to_weighted_band(
         mid = (B_lo + B_hi) // 2
         return project_to_weighted_budget(b_assign, W_map, C_prime_map, mid, bmin, bmax)
     if S < B_lo:
-        return project_to_weighted_budget(b_assign, W_map, C_prime_map, B_lo, bmin, bmax)
+        return project_to_weighted_budget(
+            b_assign, W_map, C_prime_map, B_lo, bmin, bmax
+        )
     if S > B_hi:
-        return project_to_weighted_budget(b_assign, W_map, C_prime_map, B_hi, bmin, bmax)
+        return project_to_weighted_budget(
+            b_assign, W_map, C_prime_map, B_hi, bmin, bmax
+        )
     return b_assign
 
 
@@ -285,21 +319,28 @@ def get_initial_seed(C_prime_map, W_map, avg_bits, bmin=2, bmax=4) -> Dict[str, 
 
     B_target = target_weighted_sum(float(avg_bits), {n: int(W_map[n]) for n in names})
 
-    mu, R_cont, R_clamped, S_cont, L_cont, info = solve_mu_for_budget(
+    _, R_cont, R_clamped, _, _, _ = solve_mu_for_budget(
         Cp_arr, w_arr, float(B_target), bmin, bmax
     )
     b_init = np.clip(np.floor(R_clamped + 1e-12), bmin, bmax).astype(np.int64)
-    b_int, L_int, S_int = greedy_integer_refine_budget(
+    b_int, _, _ = greedy_integer_refine_budget(
         Cp_arr, w_arr, b_init, float(B_target), bmin, bmax
     )
     b_seed = {names[i]: int(b_int[i]) for i in range(len(names))}
     b_seed = project_to_weighted_budget(
-        b_seed, {n: int(W_map[n]) for n in names}, C_prime_map, int(B_target), bmin, bmax
+        b_seed,
+        {n: int(W_map[n]) for n in names},
+        C_prime_map,
+        int(B_target),
+        bmin,
+        bmax,
     )
     return b_seed
 
 
-def generate_random_neighbor(b_assign: Dict[str, int], layer_names: List[str], bmin=2, bmax=4) -> Optional[Dict[str, int]]:
+def generate_random_neighbor(
+    b_assign: Dict[str, int], layer_names: List[str], bmin=2, bmax=4
+) -> Optional[Dict[str, int]]:
     new_b = b_assign.copy()
     c_up = [n for n in layer_names if new_b.get(n, bmin) < bmax]
     c_down = [n for n in layer_names if new_b.get(n, bmin) > bmin]
@@ -317,13 +358,14 @@ def generate_random_neighbor(b_assign: Dict[str, int], layer_names: List[str], b
 
 
 # =========================================================
-# (추가) BRP Surrogate 모델 로더/스코어러
+# BRP Surrogate 모델 로더/스코어러
 # =========================================================
 class BitSequenceEncoder(nn.Module):
     """
     Training script와 동일한 encoder.
     s(b): 낮을수록 좋음.
     """
+
     def __init__(
         self,
         L: int,
@@ -339,8 +381,8 @@ class BitSequenceEncoder(nn.Module):
         self.L = L
         self.use_proxy = use_proxy
 
-        self.bit_emb = nn.Embedding(3, bit_emb_dim)          # {2,3,4}->{0,1,2}
-        self.num_proj = nn.Linear(2, bit_emb_dim)            # [logC', logW]
+        self.bit_emb = nn.Embedding(3, bit_emb_dim)  # {2,3,4}->{0,1,2}
+        self.num_proj = nn.Linear(2, bit_emb_dim)  # [logC', logW]
         self.in_proj = nn.Linear(bit_emb_dim * 2, d_model)
         self.pos_emb = nn.Embedding(L, d_model)
 
@@ -378,11 +420,11 @@ class BitSequenceEncoder(nn.Module):
 
         C = C_log.view(1, L, 1).expand(B, L, 1)
         W = W_log.view(1, L, 1).expand(B, L, 1)
-        x_num = torch.cat([C, W], dim=-1)      # (B,L,2)
-        e_num = self.num_proj(x_num)           # (B,L,bit_emb_dim)
+        x_num = torch.cat([C, W], dim=-1)  # (B,L,2)
+        e_num = self.num_proj(x_num)  # (B,L,bit_emb_dim)
 
         x = torch.cat([e_bit, e_num], dim=-1)  # (B,L,2*bit_emb_dim)
-        x = self.in_proj(x)                    # (B,L,d_model)
+        x = self.in_proj(x)  # (B,L,d_model)
 
         pos = torch.arange(L, device=bits.device).view(1, L)
         x = x + self.pos_emb(pos)
@@ -402,10 +444,6 @@ class BitSequenceEncoder(nn.Module):
 
 
 class BRPPairwiseSurrogate(nn.Module):
-    """
-    checkpoint에는 BRPPairwiseSurrogate의 state_dict가 저장됨.
-    여기선 score_single만 사용.
-    """
     def __init__(self, encoder: BitSequenceEncoder, tau_pair: float = 1.0):
         super().__init__()
         self.encoder = encoder
@@ -427,6 +465,7 @@ class SurrogateScorer:
     - static_info.json 로드해서 per-layer logC/logW 재구성 후 z-score 정규화(훈련과 동일)
     - 입력 bit_assignment(dict) -> score(s(b)) 반환 (낮을수록 좋음)
     """
+
     def __init__(
         self,
         ckpt_path: str,
@@ -445,18 +484,20 @@ class SurrogateScorer:
         h = cfg["hparams"]
         use_proxy = not bool(h.get("no_proxy", False))
 
-        # static_info.json 경로 (훈련 config에 저장된 json_path)
         static_json_path = cfg.get("json_path", None)
         if static_json_path is None:
-            raise ValueError("[Surrogate] config.json에 json_path가 없습니다. --surrogate_config를 올바른 파일로 주세요.")
+            raise ValueError(
+                "[Surrogate] config.json에 json_path가 없습니다. --surrogate_config를 올바른 파일로 주세요."
+            )
         if not os.path.exists(static_json_path):
-            # 상대경로인 경우 config_dir 기준으로 재시도
             base = os.path.dirname(os.path.abspath(config_path))
             cand = os.path.join(base, static_json_path)
             if os.path.exists(cand):
                 static_json_path = cand
             else:
-                raise FileNotFoundError(f"[Surrogate] static_info.json을 찾을 수 없습니다: {static_json_path}")
+                raise FileNotFoundError(
+                    f"[Surrogate] static_info.json을 찾을 수 없습니다: {static_json_path}"
+                )
 
         with open(static_json_path, "r", encoding="utf-8") as f:
             static_info = json.load(f)
@@ -464,7 +505,6 @@ class SurrogateScorer:
         C_prime_map: Dict[str, float] = static_info["C_prime_map"]
         W_map: Dict[str, int] = static_info["W_map"]
 
-        # raw log feats
         C_log = np.zeros((self.L,), dtype=np.float32)
         W_log = np.zeros((self.L,), dtype=np.float32)
         for i, ln in enumerate(self.layer_names):
@@ -473,7 +513,6 @@ class SurrogateScorer:
             C_log[i] = math.log(max(cp, 1e-30))
             W_log[i] = math.log(max(w, 1.0))
 
-        # 훈련 시 저장된 z-score 파라미터 사용
         norm = cfg.get("norm", {})
         C_mu = float(norm.get("C_log_mu", float(C_log.mean())))
         C_sd = float(norm.get("C_log_sd", float(C_log.std() + 1e-6)))
@@ -496,7 +535,9 @@ class SurrogateScorer:
             dropout=float(h.get("dropout", 0.1)),
             use_proxy=use_proxy,
         )
-        model = BRPPairwiseSurrogate(encoder=encoder, tau_pair=float(h.get("tau_pair", 1.0)))
+        model = BRPPairwiseSurrogate(
+            encoder=encoder, tau_pair=float(h.get("tau_pair", 1.0))
+        )
         model.to(device)
         model.eval()
 
@@ -508,28 +549,26 @@ class SurrogateScorer:
         self.model = model
         self.use_proxy = use_proxy
 
-        # LRU score cache (tuple(sorted(items)) -> float)
         self.cache = OrderedDict()
-        self.cache_max = int(h.get("score_cache_max", 200000))  # 없으면 크게
+        self.cache_max = int(h.get("score_cache_max", 200000))
         print(f"[Surrogate] loaded: L={self.L}, use_proxy={self.use_proxy}, cache_max={self.cache_max}")
 
     def _bits_to_vec(self, b_assign: Dict[str, int]) -> List[int]:
-        out = []
-        for ln in self.layer_names:
-            out.append(int(b_assign.get(ln, self.bmin)))
-        return out
+        return [int(b_assign.get(ln, self.bmin)) for ln in self.layer_names]
 
     @torch.no_grad()
-    def score_batch(self, assigns: List[Dict[str, int]], proxy_vals: Optional[List[float]] = None, batch: int = 1024) -> np.ndarray:
+    def score_batch(
+        self,
+        assigns: List[Dict[str, int]],
+        proxy_vals: Optional[List[float]] = None,
+        batch: int = 1024,
+    ) -> np.ndarray:
         n = len(assigns)
         if n == 0:
             return np.zeros((0,), dtype=np.float64)
 
-        # cache lookup
         scores = np.empty((n,), dtype=np.float64)
-        todo_idx = []
-        todo_bits = []
-        todo_proxy = []
+        todo_idx, todo_bits, todo_proxy = [], [], []
 
         for i, b in enumerate(assigns):
             key = tuple(sorted(b.items()))
@@ -540,12 +579,8 @@ class SurrogateScorer:
             else:
                 todo_idx.append(i)
                 todo_bits.append(self._bits_to_vec(b))
-                if proxy_vals is None:
-                    todo_proxy.append(0.0)
-                else:
-                    todo_proxy.append(float(proxy_vals[i]))
+                todo_proxy.append(0.0 if proxy_vals is None else float(proxy_vals[i]))
 
-        # infer remaining
         if todo_idx:
             bits_np = np.asarray(todo_bits, dtype=np.int64)
             proxy_np = np.asarray(todo_proxy, dtype=np.float32).reshape(-1, 1)
@@ -553,10 +588,11 @@ class SurrogateScorer:
             for s in range(0, len(todo_idx), batch):
                 e = min(len(todo_idx), s + batch)
                 b_t = torch.tensor(bits_np[s:e], dtype=torch.long, device=self.device)
-                if self.use_proxy:
-                    p_t = torch.tensor(proxy_np[s:e], dtype=torch.float32, device=self.device)
-                else:
-                    p_t = None
+                p_t = (
+                    torch.tensor(proxy_np[s:e], dtype=torch.float32, device=self.device)
+                    if self.use_proxy
+                    else None
+                )
                 out = self.model.score_single(b_t, C_log=self.C_log_t, W_log=self.W_log_t, proxy=p_t).squeeze(-1)
                 out_np = out.detach().cpu().numpy().astype(np.float64)
 
@@ -572,13 +608,14 @@ class SurrogateScorer:
 
 
 # =========================================================
-# PPL Evaluator (그대로 유지)
+# PPL Evaluator
 # =========================================================
 class PplEvaluator:
     """
     Pre-baked Wq/A/B 로드 후 W_eff = Wq + A@B를 주입해 PPL 측정.
     동일 조합 반복 평가 방지를 위해 LRU 캐시 사용.
     """
+
     def __init__(
         self,
         model,
@@ -613,6 +650,7 @@ class PplEvaluator:
                 del payload
             except Exception as e:
                 print(f"[경고] {f} 로드 실패: {e}")
+
         self.target_layers = sorted(list(set(self.target_layers)))
         if not self.target_layers:
             raise ValueError(f"Pre-bake 디렉토리({bit2_dir})에서 유효한 레이어를 찾지 못했습니다.")
@@ -686,7 +724,6 @@ class PplEvaluator:
 def main(args):
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
 
-    # Phase 1: 로드
     print("--- 🔬 Phase 1: 기반 데이터 준비 ---")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id, torch_dtype=torch.float16, device_map=device  # v2 유지
@@ -705,7 +742,6 @@ def main(args):
         args.sens_csv, args.alpha_csv, args.alpha_bit, args.alpha_default
     )
 
-    # Phase 2: 평가기/시드
     print("--- 🌱 Phase 2: 시드 생성 및 평가기/서로게이트 초기화 ---")
     ppl_eval = PplEvaluator(
         model,
@@ -724,7 +760,6 @@ def main(args):
     sum_w = sum(W_map.values())
     B_target = target_weighted_sum(args.avg_bits, W_map)
 
-    # surrogate
     surrogate = SurrogateScorer(
         ckpt_path=args.surrogate_ckpt,
         config_path=args.surrogate_config,
@@ -793,10 +828,8 @@ def main(args):
     init_items = list(initial_candidates.items())  # (b_tuple, proxyL)
     init_assigns = [dict(bt) for (bt, _) in init_items]
     init_proxys = [float(Lv) for (_, Lv) in init_items]
-
     init_scores = surrogate.score_batch(init_assigns, proxy_vals=init_proxys, batch=args.surrogate_batch)
 
-    # surrogate로 정렬 후 topK true eval
     K0 = max(int(args.true_eval_topk), int(args.beam_size))
     idx_sorted = np.argsort(init_scores)[: min(K0, len(init_items))].tolist()
 
@@ -817,18 +850,39 @@ def main(args):
     wavg0 = weighted_sum_bits(beam[0][2], W_map) / sum_w if sum_w > 0 else 0.0
     print(f"초기 빔 Best PPL: {beam[0][0]:.4f} | w-avg={wavg0:.6f} | sur={beam[0][3]:.6f}")
 
+    # -------------------------------
+    # Global-best tracker
+    # -------------------------------
+    os.makedirs(args.output_dir, exist_ok=True)
+    global_bit_csv = os.path.join(args.output_dir, "bit_assign.csv")
+
+    global_best_ppl, global_best_L, global_best_bits, global_best_sur = beam[0]
+    global_best_gen = 0
+    global_best_ts = int(time.time())
+
+    atomic_save_bit_assign_csv(global_bit_csv, global_best_bits)
+    print(f"[GlobalBest] init saved: {global_bit_csv} (ppl={global_best_ppl:.6f})")
+
     # -------------------------------------------------------
     # Phase 3: 수렴까지 반복
     # -------------------------------------------------------
     print("--- 🎲 Phase 3: Surrogate-guided 빔 서치(수렴까지) 시작 ---")
-    os.makedirs(args.output_dir, exist_ok=True)
     ppl_curve_csv = os.path.join(args.output_dir, "ppl_curve.csv")
     new_file = not os.path.exists(ppl_curve_csv)
     curve_f = open(ppl_curve_csv, "a", newline="", encoding="utf-8")
     curve_w = csv.writer(curve_f)
     if new_file:
         curve_w.writerow(
-            ["generation", "best_ppl", "best_L", "best_sur", "weighted_avg_bits", "num_finalists", "num_true_eval", "timestamp", "note"]
+            [
+                "generation",
+                "best_ppl",
+                "global_best_ppl",
+                "best_L",
+                "best_sur",
+                "weighted_avg_bits",
+                "timestamp",
+                "note",
+            ]
         )
         curve_f.flush()
 
@@ -836,7 +890,6 @@ def main(args):
     gen = 0
     no_improve = 0
     stable_bits = 0
-    prev_best_ppl = float("inf")
     prev_best_bits = None
 
     max_g = args.max_generations if args.max_generations > 0 else (args.generations if args.generations > 0 else 0)
@@ -853,16 +906,18 @@ def main(args):
                 neighbor = generate_random_neighbor(b_assign, target_layers_list, args.bmin, args.bmax)
                 if neighbor:
                     neighbor = ensure_complete_assignment(neighbor, target_layers_list, args.bmin)
-                    neighbor = project_to_weighted_band(neighbor, W_map, C_prime_filtered, B_lo, B_hi, args.bmin, args.bmax)
+                    neighbor = project_to_weighted_band(
+                        neighbor, W_map, C_prime_filtered, B_lo, B_hi, args.bmin, args.bmax
+                    )
                     all_candidates.add(tuple(sorted(neighbor.items())))
 
         # Filter (proxy)
         candidate_L_scores = [(proxy_loss_calc(dict(bt)), bt) for bt in all_candidates]
         candidate_L_scores.sort(key=lambda x: x[0])
-        finalists = candidate_L_scores[: args.filter_p]  # list[(proxyL, b_tuple)]
+        finalists = candidate_L_scores[: args.filter_p]
         num_finalists = len(finalists)
 
-        # Surrogate rank on finalists
+        # Surrogate rank
         fin_assigns = [dict(bt) for (L, bt) in finalists]
         fin_proxys = [float(L) for (L, bt) in finalists]
         fin_scores = surrogate.score_batch(fin_assigns, proxy_vals=fin_proxys, batch=args.surrogate_batch)
@@ -870,56 +925,87 @@ def main(args):
         K_true = max(int(args.true_eval_topk), int(args.beam_size))
         top_idx = np.argsort(fin_scores)[: min(K_true, num_finalists)].tolist()
 
-        # Evaluate true PPL only on surrogate top-K
+        # True eval only surrogate top-K
         new_beam_candidates = []
         for idx in tqdm(top_idx, desc=f"G-{gen} true PPL (sur-top{len(top_idx)})", leave=False):
             l_score, b_tuple = finalists[idx]
             b_dict = dict(b_tuple)
-            b_dict = project_to_weighted_band(b_dict, W_map, C_prime_filtered, B_lo, B_hi, args.bmin, args.bmax)
+            b_dict = project_to_weighted_band(
+                b_dict, W_map, C_prime_filtered, B_lo, B_hi, args.bmin, args.bmax
+            )
             ppl = ppl_eval.evaluate(b_dict)
             new_beam_candidates.append((ppl, float(l_score), b_dict, float(fin_scores[idx])))
 
-        # Select (by true ppl)
         new_beam_candidates.sort(key=lambda x: x[0])
         if not new_beam_candidates:
             print("[경고] 이번 generation에서 true PPL 평가 후보가 비었습니다. 종료합니다.")
             break
-        beam = new_beam_candidates[: args.beam_size]
 
+        beam = new_beam_candidates[: args.beam_size]
         best_ppl, best_L, best_bits, best_sur = beam[0]
+
         S = weighted_sum_bits(best_bits, W_map)
         wavg = S / sum_w if sum_w > 0 else 0.0
 
-        abs_gain = prev_best_ppl - best_ppl
-        rel_gain = (abs_gain / prev_best_ppl) if (math.isfinite(prev_best_ppl) and prev_best_ppl > 0) else float("inf")
-        improved = (abs_gain > args.converge_eps) or (rel_gain > args.converge_rel_eps)
-        note = "improved" if improved else "no-improve"
+        # -------------------------------
+        # Global-best check (FIXED ORDER)
+        # 1) improvement 판단
+        # 2) global 갱신(필요 시)
+        # 3) 그 다음에 CSV에 "갱신된 global" 기록
+        # -------------------------------
+        if math.isfinite(global_best_ppl) and global_best_ppl > 0:
+            abs_gain_g = global_best_ppl - best_ppl
+            rel_gain_g = abs_gain_g / global_best_ppl
+        else:
+            abs_gain_g = float("inf")
+            rel_gain_g = float("inf")
 
+        global_improved = (abs_gain_g > args.converge_eps) or (rel_gain_g > args.converge_rel_eps)
+
+        if global_improved:
+            global_best_ppl, global_best_L, global_best_bits, global_best_sur = best_ppl, best_L, best_bits, best_sur
+            global_best_gen = gen
+            global_best_ts = int(time.time())
+
+            atomic_save_bit_assign_csv(global_bit_csv, global_best_bits)
+            tqdm.write(f"[GlobalBest] UPDATED @G-{gen} ppl={global_best_ppl:.6f} saved={global_bit_csv}")
+
+            no_improve = 0
+            note = "global-improved"
+        else:
+            no_improve += 1
+            note = "no-improve"
+
+        # 로그는 세대 best + (갱신된) global best 모두 출력
         tqdm.write(
             f"--- G-{gen} 완료 | Best PPL: {best_ppl:.4f} | sur={best_sur:.6f} | L={best_L:.2e} | "
-            f"w-avg={wavg:.6f} | finalists={num_finalists} true_eval={len(top_idx)} | {note}"
+            f"w-avg={wavg:.6f} | finalists={num_finalists} true_eval={len(top_idx)} | {note} | "
+            f"GlobalBest: {global_best_ppl:.4f}"
         )
 
+        # CSV에는 "갱신된 global_best_ppl"을 기록 (lag 제거)
         try:
             curve_w.writerow(
-                [gen, f"{best_ppl:.6f}", f"{best_L:.6e}", f"{best_sur:.6f}", f"{wavg:.6f}",
-                 int(num_finalists), int(len(top_idx)), int(time.time()), note]
+                [
+                    gen,
+                    f"{best_ppl:.6f}",
+                    f"{global_best_ppl:.6f}",
+                    f"{best_L:.6e}",
+                    f"{best_sur:.6f}",
+                    f"{wavg:.6f}",
+                    int(time.time()),
+                    note,
+                ]
             )
             curve_f.flush()
         except Exception as e:
             tqdm.write(f"[경고] ppl_curve.csv 기록 실패: {e}")
 
-        if improved:
-            no_improve = 0
-        else:
-            no_improve += 1
-
+        # stable_bits: 세대 best bit 반복 여부
         if prev_best_bits is not None and best_bits == prev_best_bits:
             stable_bits += 1
         else:
             stable_bits = 0
-
-        prev_best_ppl = min(prev_best_ppl, best_ppl)
         prev_best_bits = best_bits
 
         stop_reasons = []
@@ -938,13 +1024,17 @@ def main(args):
 
         gen += 1
 
-    # Phase 4: 결과
     print("\n--- 🏆 Phase 4: 탐색 완료 ---")
-    best_ppl, best_L, best_b, best_sur = beam[0]
-    print(f"최종 Best PPL: {best_ppl:.4f} | best_sur={best_sur:.6f}")
+    print(
+        f"최종 Global Best PPL: {global_best_ppl:.4f} | best_sur={global_best_sur:.6f} | "
+        f"found@G-{global_best_gen}"
+    )
+    print(f"최종 할당 파일(글로벌 베스트): {global_bit_csv}")
 
+    best_b = global_best_bits
     S_final = weighted_sum_bits(best_b, W_map)
     wavg_final = S_final / sum_w if sum_w > 0 else 0.0
+
     if use_band:
         print(
             f"최종 Σ w·b = {S_final} / Σw={sum_w} → 가중평균={wavg_final:.6f} "
@@ -960,15 +1050,6 @@ def main(args):
         curve_f.close()
     except Exception:
         pass
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    out_csv = os.path.join(args.output_dir, "bit_assign.csv")
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["layer_name", "R_int"])
-        for name, bit in sorted(best_b.items()):
-            writer.writerow([name, bit])
-    print(f"최종 할당 저장: {out_csv}")
 
     cache_path = os.path.join(args.output_dir, "ppl_cache.json")
     str_cache = {str(k): v for k, v in ppl_eval.ppl_cache.items()}
