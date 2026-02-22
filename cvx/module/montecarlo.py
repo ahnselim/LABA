@@ -7,12 +7,14 @@ easy for future scripts to import common helpers.
 """
 
 import csv
+import json
 import math
 import os
 import random
 import re
+import time
 from functools import reduce
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +30,10 @@ from RAQ.proxy_codes.step3_bit_optimization import (
 __all__ = [
     "_safe_name",
     "atomic_save_bit_assign_csv",
+    "append_training_samples",
+    "bits_to_json",
+    "check_convergence",
+    "compute_budget_band_for_avg_bits",
     "run_live_ppl_eval",
     "load_seed_from_csv",
     "build_c_prime_map",
@@ -35,6 +41,8 @@ __all__ = [
     "weighted_sum_bits",
     "gcd_list",
     "target_weighted_sum",
+    "_beam_from_serializable",
+    "_beam_to_serializable",
     "ensure_complete_assignment",
     "project_to_weighted_budget",
     "project_to_weighted_band",
@@ -62,6 +70,63 @@ def atomic_save_bit_assign_csv(path: str, bits: Dict[str, int]):
         for name, bit in sorted(bits.items()):
             w.writerow([name, int(bit)])
     os.replace(tmp, path)
+
+
+def bits_to_json(bit_dict: Dict[str, int]) -> str:
+    return json.dumps({k: int(v) for k, v in sorted(bit_dict.items())})
+
+
+def _beam_to_serializable(
+    beam: List[Tuple[float, float, Dict[str, int], float]]
+) -> List[Dict[str, float]]:
+    out = []
+    for (ppl, L, bits, sur) in beam:
+        out.append(
+            {
+                "ppl": float(ppl),
+                "L": float(L),
+                "sur": float(sur),
+                "bits": {k: int(v) for k, v in sorted(bits.items())},
+            }
+        )
+    return out
+
+
+def _beam_from_serializable(
+    rows: List[Dict[str, float]]
+) -> List[Tuple[float, float, Dict[str, int], float]]:
+    beam = []
+    for r in rows:
+        bits = {k: int(v) for k, v in r["bits"].items()}
+        beam.append(
+            (float(r["ppl"]), float(r["L"]), bits, float(r.get("sur", r["L"])))
+        )
+    beam.sort(key=lambda x: x[0])
+    return beam
+
+
+def append_training_samples(csv_path: str, rows: List[Dict[str, object]]):
+    if not rows:
+        return
+    dirpath = os.path.dirname(csv_path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    new_file = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "generation",
+                "proxy_loss",
+                "measured_ppl",
+                "bit_assignment_json",
+                "avg_bits_target",
+            ],
+        )
+        if new_file:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 @torch.no_grad()
@@ -117,7 +182,7 @@ def build_c_prime_map(sens_csv, alpha_csv, alpha_bit=3, alpha_default=1.0):
     return C_prime_map, W_map
 
 
-def calculate_proxy_loss(bit_assignment, C_prime_map, bmin=2):
+def calculate_proxy_loss(bit_assignment, C_prime_map, bmin=1):
     total_loss = 0.0
     for name, cp in C_prime_map.items():
         bit = bit_assignment.get(name, bmin)
@@ -146,6 +211,34 @@ def target_weighted_sum(avg_bits: float, W_map: Dict[str, int]) -> int:
     g = gcd_list([int(w) for w in W_map.values()]) if W_map else 1
     raw = avg_bits * sum_w
     return int(round(raw / g) * g)
+
+
+def compute_budget_band_for_avg_bits(
+    avg_bits_target: float,
+    W_map: Dict[str, int],
+    quantum: float,
+    use_band: bool,
+) -> Tuple[int, int, int, int]:
+    """
+    returns: (B_lo, B_hi, sum_w, B_target_exact)
+    - use_band=False면 B_lo=B_hi=B_target
+    - use_band=True면 round_quantum 기준으로 [avg - q/2, avg + q/2) 밴드로 B_lo/B_hi 구성
+    """
+    sum_w = int(sum(W_map.values()))
+    B_target = target_weighted_sum(float(avg_bits_target), W_map)
+    if not use_band:
+        return B_target, B_target, sum_w, B_target
+
+    eps = 1e-9
+    avg_lo = float(avg_bits_target) - 0.5 * float(quantum)
+    avg_hi = float(avg_bits_target) + 0.5 * float(quantum) - eps
+
+    g = gcd_list(list(W_map.values())) or 1
+    B_lo = int(math.ceil((avg_lo * sum_w) / g) * g)
+    B_hi = int(math.floor((avg_hi * sum_w) / g) * g)
+    if B_lo > B_hi:
+        B_lo = B_hi = B_target
+    return B_lo, B_hi, sum_w, B_target
 
 
 def ensure_complete_assignment(
@@ -244,7 +337,7 @@ def project_to_weighted_band(
     return b_assign
 
 
-def get_initial_seed(C_prime_map, W_map, avg_bits, bmin=2, bmax=4) -> Dict[str, int]:
+def get_initial_seed(C_prime_map, W_map, avg_bits, bmin=1, bmax=4) -> Dict[str, int]:
     names = [n for n in C_prime_map.keys() if n in W_map]
     Cp_arr = np.array([C_prime_map[n] for n in names], dtype=np.float64)
     w_arr = np.array([W_map[n] for n in names], dtype=np.float64)
@@ -274,7 +367,7 @@ def get_initial_seed(C_prime_map, W_map, avg_bits, bmin=2, bmax=4) -> Dict[str, 
 
 
 def generate_random_neighbor(
-    b_assign: Dict[str, int], layer_names: List[str], bmin=2, bmax=4
+    b_assign: Dict[str, int], layer_names: List[str], bmin=1, bmax=4
 ) -> Optional[Dict[str, int]]:
     new_b = b_assign.copy()
     c_up = [n for n in layer_names if new_b.get(n, bmin) < bmax]
@@ -291,3 +384,51 @@ def generate_random_neighbor(
     new_b[k] = new_b.get(k, bmin) - 1
     return new_b
 
+
+def check_convergence(
+    *,
+    best_ppl: float,
+    best_bits: Dict[str, int],
+    global_best_ppl: float,
+    no_improve: int,
+    stable_bits: int,
+    prev_best_bits: Optional[Dict[str, int]],
+    converge_eps: float,
+    converge_rel_eps: float,
+    patience: int,
+    stable_bits_patience: int,
+    time_limit_sec: int,
+    start_ts: float,
+    gen_idx: int,
+    max_g: int,
+) -> Tuple[bool, int, int, Optional[Dict[str, int]], List[str]]:
+    if math.isfinite(global_best_ppl) and global_best_ppl > 0:
+        abs_gain_g = global_best_ppl - best_ppl
+        rel_gain_g = abs_gain_g / global_best_ppl
+    else:
+        abs_gain_g = float("inf")
+        rel_gain_g = float("inf")
+
+    global_improved = (abs_gain_g > converge_eps) or (rel_gain_g > converge_rel_eps)
+    if global_improved:
+        no_improve = 0
+    else:
+        no_improve += 1
+
+    if prev_best_bits is not None and best_bits == prev_best_bits:
+        stable_bits += 1
+    else:
+        stable_bits = 0
+    prev_best_bits = best_bits
+
+    stop_reasons = []
+    if patience > 0 and no_improve >= patience:
+        stop_reasons.append(f"no-improve≥{patience}")
+    if stable_bits_patience > 0 and stable_bits >= stable_bits_patience:
+        stop_reasons.append(f"stable-bits≥{stable_bits_patience}")
+    if time_limit_sec > 0 and (time.time() - start_ts >= time_limit_sec):
+        stop_reasons.append("time-limit")
+    if max_g > 0 and gen_idx + 1 >= max_g:
+        stop_reasons.append("max-generations")
+
+    return global_improved, no_improve, stable_bits, prev_best_bits, stop_reasons

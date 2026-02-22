@@ -57,11 +57,11 @@ def safe_makedirs(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def parse_bit_assignment(bit_json: str, layer_names: List[str], bmin: int = 2) -> List[int]:
+def parse_bit_assignment(bit_json: str, layer_names: List[str], bmin: int = 1) -> List[int]:
     """
     Accepts:
-      - dict: {"layer.name": 2/3/4, ...}
-      - list: [2,3,2,...] aligned with layer_names
+      - dict: {"layer.name": 1/2/3/4, ...}
+      - list: [1,2,3,...] aligned with layer_names
     Returns:
       - list of ints length L
     """
@@ -130,7 +130,7 @@ class Cand:
 def load_generation_pool(
     csv_path: str,
     static_info_path: str,
-    bmin: int = 2,
+    bmin: int = 1,
 ) -> Tuple[List[str], Dict[int, List[Cand]], Dict[str, Any]]:
     with open(static_info_path, "r", encoding="utf-8") as f:
         static_info = json.load(f)
@@ -296,18 +296,23 @@ class BitSequenceEncoderInput3(nn.Module):
         token_mlp_dim: int = 128,
         dropout: float = 0.1,
         use_proxy: bool = True,
+        bmin: int = 1,
+        bmax: int = 4,
         debug_alpha_once: bool = False,  # PATCH
     ):
         super().__init__()
         self.L = L
         self.use_proxy = use_proxy
+        self.bmin = int(bmin)
+        self.bmax = int(bmax)
+        self.num_bits = self.bmax - self.bmin + 1
 
         # PATCH
         self.debug_alpha_once = bool(debug_alpha_once)
         self._dbg_printed = False
 
-        # bits {2,3,4} -> idx {0,1,2}
-        self.bit_emb = nn.Embedding(3, bit_emb_dim)
+        # bits {bmin..bmax} -> idx {0..num_bits-1}
+        self.bit_emb = nn.Embedding(self.num_bits, bit_emb_dim)
 
         # numeric features: [logC, logW, logit(alpha_sel)]
         self.num_proj = nn.Linear(3, bit_emb_dim)
@@ -326,20 +331,20 @@ class BitSequenceEncoderInput3(nn.Module):
 
     def forward(
         self,
-        bits: torch.Tensor,                 # (B,L) in {2,3,4}
+        bits: torch.Tensor,                 # (B,L) in {bmin..bmax}
         C_log: torch.Tensor,                # (L,)
         W_log: torch.Tensor,                # (L,)
-        alpha_logit_table: torch.Tensor,    # (L,3) normalized
+        alpha_logit_table: torch.Tensor,    # (L,num_bits) normalized
         proxy: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, L = bits.shape
         assert L == self.L
 
-        bit_idx = torch.clamp(bits - 2, 0, 2)                  # (B,L)
+        bit_idx = torch.clamp(bits - self.bmin, 0, self.num_bits - 1)  # (B,L)
         e_bit = self.bit_emb(bit_idx)                          # (B,L,bit_emb_dim)
 
         # alpha gather: (B,L,1)
-        a_tbl = alpha_logit_table.view(1, L, 3).expand(B, L, 3)
+        a_tbl = alpha_logit_table.view(1, L, self.num_bits).expand(B, L, self.num_bits)
         a_sel = torch.gather(a_tbl, 2, bit_idx.unsqueeze(-1))   # (B,L,1)
 
         # -------------------------
@@ -350,22 +355,18 @@ class BitSequenceEncoderInput3(nn.Module):
             try:
                 def _alpha_sel_for_bit(bb: int) -> float:
                     bi = torch.full((1, L), bb, device=bits.device, dtype=bits.dtype)  # (1,L)
-                    idx = torch.clamp(bi - 2, 0, 2)                                   # (1,L)
+                    idx = torch.clamp(bi - self.bmin, 0, self.num_bits - 1)           # (1,L)
                     a = torch.gather(
-                        alpha_logit_table.view(1, L, 3),
+                        alpha_logit_table.view(1, L, self.num_bits),
                         2,
                         idx.unsqueeze(-1)
                     )  # (1,L,1)
                     return float(a[0, 0, 0].detach().item())
 
-                a2 = _alpha_sel_for_bit(2)
-                a3 = _alpha_sel_for_bit(3)
-                a4 = _alpha_sel_for_bit(4)
-
                 print("[DBG] alpha_gather sanity (layer0, logit space):", flush=True)
-                print(f"  bit=2 -> {a2:.6f}", flush=True)
-                print(f"  bit=3 -> {a3:.6f}", flush=True)
-                print(f"  bit=4 -> {a4:.6f}", flush=True)
+                for bb in range(self.bmin, self.bmax + 1):
+                    av = _alpha_sel_for_bit(bb)
+                    print(f"  bit={bb} -> {av:.6f}", flush=True)
             except Exception as e:
                 print(f"[DBG] alpha_gather sanity failed: {e}", flush=True)
 
@@ -480,33 +481,55 @@ def evaluate_ranking_metrics(
 # -----------------------------
 # Alpha parsing helper
 # -----------------------------
-AlphaSpec = Union[float, int, Dict[str, float], Dict[int, float], List[float], Tuple[float, float, float]]
+AlphaSpec = Union[float, int, Dict[str, float], Dict[int, float], List[float], Tuple[float, float, float], Tuple[float, float, float, float]]
 
-def parse_alpha_per_bit(am: Optional[AlphaSpec]) -> Tuple[float, float, float]:
+def parse_alpha_per_bit(am: Optional[AlphaSpec], bmin: int = 1, bmax: int = 4) -> Tuple[float, ...]:
     """
-    alpha_map[layer] 가 아래 중 무엇이든 받아서 (a2,a3,a4)로 통일.
-      - dict: {"2":a2,"3":a3,"4":a4} 또는 {2:a2,3:a3,4:a4}
-      - float/int: a2=a3=a4=value
-      - list/tuple(len=3): [a2,a3,a4]
-      - None: 1,1,1
+    alpha_map[layer] 가 아래 중 무엇이든 받아서 (bmin..bmax) 범위로 통일.
+      - dict: {"1":a1,...} 또는 {1:a1,...}
+      - float/int: 모든 bit에 동일 값
+      - list/tuple(len=n): n = bmax-bmin+1
+      - None: 모든 bit에 1.0
     """
+    bmin = int(bmin)
+    bmax = int(bmax)
+    n = bmax - bmin + 1
+    if n <= 0:
+        raise ValueError(f"Invalid bit range: bmin={bmin}, bmax={bmax}")
+
     if am is None:
-        return 1.0, 1.0, 1.0
+        return tuple(1.0 for _ in range(n))
 
     if isinstance(am, (float, int)):
         v = float(am)
-        return v, v, v
+        return tuple(v for _ in range(n))
 
-    if isinstance(am, (list, tuple)) and len(am) == 3:
-        return float(am[0]), float(am[1]), float(am[2])
+    if isinstance(am, (list, tuple)):
+        vals = [float(x) for x in am]
+        if len(vals) == n:
+            return tuple(vals)
+        if len(vals) == 3 and n == 4 and bmin == 1 and bmax == 4:
+            a2, a3, a4 = vals
+            return (float(a2), float(a2), float(a3), float(a4))
+        if len(vals) > n:
+            return tuple(vals[:n])
+        pad = vals[-1] if vals else 1.0
+        vals = vals + [pad] * (n - len(vals))
+        return tuple(vals)
 
     if isinstance(am, dict):
-        a2 = float(am.get("2", am.get(2, 1.0)))
-        a3 = float(am.get("3", am.get(3, 1.0)))
-        a4 = float(am.get("4", am.get(4, 1.0)))
-        return a2, a3, a4
+        out = []
+        for b in range(bmin, bmax + 1):
+            if str(b) in am or b in am:
+                v = float(am.get(str(b), am.get(b)))
+            elif b == 1 and (str(2) in am or 2 in am):
+                v = float(am.get(str(2), am.get(2)))
+            else:
+                v = 1.0
+            out.append(v)
+        return tuple(out)
 
-    return 1.0, 1.0, 1.0
+    return tuple(1.0 for _ in range(n))
 
 
 # -----------------------------
@@ -524,7 +547,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
 
     # bits range (for parsing fallback only)
-    parser.add_argument("--bmin", type=int, default=2)
+    parser.add_argument("--bmin", type=int, default=1)
     parser.add_argument("--bmax", type=int, default=4)
 
     # pair sampling
@@ -647,7 +670,10 @@ def train_surrogate_mixer(
 
     C_log = np.zeros((L,), dtype=np.float32)
     W_log = np.zeros((L,), dtype=np.float32)
-    alpha_table = np.zeros((L, 3), dtype=np.float32)
+    num_bits = int(args.bmax) - int(args.bmin) + 1
+    if num_bits <= 0:
+        raise ValueError(f"Invalid bit range: bmin={args.bmin}, bmax={args.bmax}")
+    alpha_table = np.zeros((L, num_bits), dtype=np.float32)
 
     for i, ln in enumerate(layer_names):
         c = float(C_map.get(ln, 0.0))
@@ -656,10 +682,9 @@ def train_surrogate_mixer(
         W_log[i] = math.log(max(w, 1.0))
 
         am = alpha_map.get(ln, None)
-        a2, a3, a4 = parse_alpha_per_bit(am)
-        alpha_table[i, 0] = a2
-        alpha_table[i, 1] = a3
-        alpha_table[i, 2] = a4
+        avals = parse_alpha_per_bit(am, bmin=args.bmin, bmax=args.bmax)
+        for j, av in enumerate(avals):
+            alpha_table[i, j] = av
 
     C_log_n, C_mu, C_sd = zscore(C_log)
     W_log_n, W_mu, W_sd = zscore(W_log)
@@ -669,7 +694,7 @@ def train_surrogate_mixer(
     alpha_logit = np.log(a / (1.0 - a)).astype(np.float32)
 
     alpha_flat_n, A_mu, A_sd = zscore(alpha_logit.reshape(-1))
-    alpha_logit_n = alpha_flat_n.reshape(L, 3).astype(np.float32)
+    alpha_logit_n = alpha_flat_n.reshape(L, num_bits).astype(np.float32)
 
     C_log_t = torch.tensor(C_log_n, dtype=torch.float32, device=device)
     W_log_t = torch.tensor(W_log_n, dtype=torch.float32, device=device)
@@ -717,6 +742,8 @@ def train_surrogate_mixer(
         token_mlp_dim=args.token_mlp_dim,
         dropout=args.dropout,
         use_proxy=(not args.no_proxy),
+        bmin=args.bmin,
+        bmax=args.bmax,
         debug_alpha_once=getattr(args, "debug_alpha_once", False),
     )
     model = BRPPairwiseSurrogate(encoder=encoder, tau_pair=args.tau_pair).to(device)

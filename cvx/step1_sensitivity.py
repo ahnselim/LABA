@@ -17,7 +17,7 @@ Step 1 — Layerwise Sensitivity C_j Estimation (no grouping, SlimPajama-friendl
   --dataset DKYoon/SlimPajama-6B \
   --seq_len 1024 --batch_size 2 --num_batches 50 \
   --dtype bf16 --device_map auto \
-  --output_dir ./artifacts/bitmin/step1
+  --output_dir ../artifacts/bitmin/step1
 
 옵션:
  • --dataset cerebras/SlimPajama-627B 로도 사용 가능

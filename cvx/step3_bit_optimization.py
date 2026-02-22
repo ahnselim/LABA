@@ -21,18 +21,18 @@ Step 3 — Bit Optimization (Continuous → Integer), layerwise (no grouping)
     --alpha_bit 3 \
     --C_col C_mean_per_batch \
     --target_ratio 0.40 \
-    --bmin 2 --bmax 4 \
+    --bmin 1 --bmax 4 \
     --output_dir ./artifacts/bitmin/step3
 
   # (B) budget 모드 (평균 비트 = 2.25)
   python step3_bit_optimization.py \
-    --sens_csv ../artifacts/montecarlo/step1/layerwise_sensitivity.csv \
-    --alpha_csv ../artifacts/montecarlo/step2/alpha_layerwise_rank64.csv \
+    --sens_csv ./artifacts/bitmin/step1/layerwise_sensitivity.csv \
+    --alpha_csv ./artifacts/bitmin/step2_g128/alpha_layerwise_rankvar.csv \
     --alpha_bit 3 \
     --C_col C_mean_per_batch \
     --avg_bits 2.50 \
-    --bmin 2 --bmax 4 \
-    --output_dir ../artifacts/montecarlo/step3_budget
+    --bmin 1 --bmax 4 \
+    --output_dir ./artifacts/bitmin/step3_budget_g128
 """
 
 import os, csv, math, argparse
@@ -388,7 +388,7 @@ def main():
         "--alpha_bit",
         type=int,
         default=3,
-        choices=[2, 3, 4],
+        choices=[1, 2, 3, 4],
         help="alpha(b)에서 사용할 bit",
     )
     ap.add_argument(
@@ -432,7 +432,7 @@ def main():
         default=1.0,
         help="alpha CSV에 항목 없을 때 기본 α",
     )
-    ap.add_argument("--bmin", type=int, default=2)
+    ap.add_argument("--bmin", type=int, default=1)
     ap.add_argument("--bmax", type=int, default=4)
     ap.add_argument("--max_iter", type=int, default=64)
     ap.add_argument("--tol_rel", type=float, default=1e-6)

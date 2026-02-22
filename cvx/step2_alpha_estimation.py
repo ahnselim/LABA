@@ -14,23 +14,64 @@ Step 2 — Layerwise Residual Ratio α Estimation (fixed-rank restore, no groupi
 
 ※ α 정의/계산식, OAS diag 계산식, 2-bit qmode 선택 로직, SVD 기반 Lq/tail/alpha는 그대로 유지.
 
-python step2_alpha_estimation_optimized.py \
+[추가] bit별 group_size / rank 를 다르게 지정 가능:
+  예) 2bit: group=32, rank=128 / 3bit: group=64, rank=64 / 4bit: group=128, rank=32
+
+CUDA_VISIBLE_DEVICES=3 \
+python step2_alpha_estimation.py \
   --model_id meta-llama/Llama-3.2-3B \
   --dataset DKYoon/SlimPajama-6B \
   --nsamples 64 --seqlen 2048 \
-  --rank 64 --group_size 128 \
-  --output_dir ./artifacts/bitmin/step2 \
-  --calib_cache_dir ./artifacts/bitmin
+  --bits 2 3 4 \
+  --rank_map "2:64,3:64,4:64" \
+  --group_size_map "2:32,3:64,4:128" \
+  --output_dir ./artifacts/bitmin/step2_r64 \
+  --calib_cache_dir ./artifacts/bitmin \
+  --reuse_calib
+
+CUDA_VISIBLE_DEVICES=3 \
+python step2_alpha_estimation.py \
+  --model_id meta-llama/Llama-3.2-3B \
+  --dataset DKYoon/SlimPajama-6B \
+  --nsamples 64 --seqlen 2048 \
+  --bits 1 2 3 4 \
+  --rank_map "1:256,2:128,3:64,4:32" \
+  --group_size_map "1:16,2:32,3:64,4:128" \
+  --output_dir ../artifacts/bitmin/step2_dyn \
+  --calib_cache_dir ../artifacts/bitmin \
+  --reuse_calib
 
 """
 
 import os, re, gc, csv, json, argparse
 from typing import Dict, List, Optional, Tuple
-from collections import Counter
 
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+
+# -------------------------------
+# bit별 map 파서
+# -------------------------------
+def _parse_int_map(s: Optional[str]) -> Dict[int, int]:
+    """
+    "2:32,3:64,4:128" 또는 "2:32 3:64 4:128" 형태를 {2:32,3:64,4:128}로 파싱
+    """
+    if s is None:
+        return {}
+    s = s.strip()
+    if not s:
+        return {}
+    items = re.split(r"[,\s]+", s)
+    out: Dict[int, int] = {}
+    for it in items:
+        if not it:
+            continue
+        if ":" not in it:
+            raise ValueError(f"Invalid map token: '{it}' (expected k:v)")
+        k, v = it.split(":", 1)
+        out[int(k)] = int(v)
+    return out
 
 # -------------------------------
 # HF
@@ -258,11 +299,12 @@ def estimate_diag_cov_oas_per_module(
             d = x.shape[-1]
             name_to_dim[mod_name] = d
             if mod_name not in stats:
-                # 원본은 CPU float64 누적이었는데, 동기화 제거를 위해 GPU에서 누적 후 마지막에만 CPU로 이동
+                # 모듈이 위치한 디바이스에서 누적 (device map 사용 시 모듈마다 다를 수 있음)
+                acc_device = x.device
                 stats[mod_name] = {
-                    "sum": torch.zeros(d, dtype=torch.float64, device=device),
-                    "sumsq": torch.zeros(d, dtype=torch.float64, device=device),
-                    "n": torch.zeros((), dtype=torch.long, device=device),
+                    "sum": torch.zeros(d, dtype=torch.float64, device=acc_device),
+                    "sumsq": torch.zeros(d, dtype=torch.float64, device=acc_device),
+                    "n": torch.zeros((), dtype=torch.long, device=acc_device),
                 }
             # sum, sumsq, n 누적 (연산식 동일)
             stats[mod_name]["sum"] += x.sum(dim=0, dtype=torch.float64)
@@ -355,6 +397,45 @@ def _percentile_clip_lastdim(X: torch.Tensor, lo_pct: float, hi_pct: float) -> t
 # -------------------------------
 # Quantization (step3와 동일 로직) - 그대로
 # -------------------------------
+@torch.no_grad()
+def dequant_1bit_mu_beta(W: torch.Tensor, group_size: int):
+    """
+    1bit quantization (binary with global mu shift + per-group beta)
+
+    스텝:
+      1) beta (per-group scale):
+         - W를 group_size=k로 나누고
+         - 각 그룹에서 beta = mean(abs(W_ij))
+      2) mu (global mean):
+         - 전체 weight(예: 4096x4096)의 평균 mu = mean(W)
+      3) sign:
+         - W_center = W - mu
+         - W_center < 0 → -1, W_center > 0 → +1 (0은 +1로 취급)
+      4) dequant:
+         - 각 그룹에 대해 W_hat = sign * beta
+    """
+    # float32로 변환
+    W32 = W.to(torch.float32)
+
+    # (1) beta: 원본 W 기준으로 그룹별 평균 |W|
+    Wg_orig, O_, G, S, orig_I = _to_groups(W32, group_size)
+    beta = Wg_orig.abs().mean(dim=-1, keepdim=True)  # [O_, G, 1]
+
+    # (2) mu: 레이어 전체 평균
+    mu = W32.mean()
+
+    # (3) sign: (W - mu)를 기준으로 binary 부호 결정
+    W_center = W32 - mu
+    Wg_center, _, _, _, _ = _to_groups(W_center, group_size)
+    sgn = torch.sign(Wg_center)
+    sgn[sgn == 0] = 1.0  # 0은 +1로 처리
+
+    # (4) dequant: sign * beta
+    deq_g = sgn * beta  # [O_, G, S]
+    deq = _from_groups(deq_g, orig_I)
+
+    return deq.to(dtype=W.dtype, device=W.device)
+
 @torch.no_grad()
 def dequant_2bit_lloyd2_sym(W: torch.Tensor, group_size: int, clip_pct: float = 99.9, steps: int = 4):
     W32 = W.to(torch.float32)
@@ -453,8 +534,10 @@ def measure_alpha_for_layer(
     W: torch.Tensor,
     sqrt_diag: torch.Tensor,  # [n]
     bits: List[int],
-    rank_r: int,
-    group_size: int,
+    rank_map: Dict[int, int],
+    group_size_map: Dict[int, int],
+    default_rank: int,
+    default_group_size: int,
     clip_pct: float,
     lloyd_steps: int,
     qtr_steps: int,
@@ -471,9 +554,20 @@ def measure_alpha_for_layer(
     out: List[Tuple[int, str, float, float, float]] = []
 
     for b in bits:
-        if b == 2:
-            Wq_l = dequant_2bit_lloyd2_sym(W, group_size, clip_pct, lloyd_steps)
-            Wq_z = dequant_2bit_qtr_zero(W, group_size, clip_pct, qtr_steps)
+        # bit별 group/rank 적용
+        gs = int(group_size_map.get(int(b), default_group_size))
+        r_target = int(rank_map.get(int(b), default_rank))
+
+        if b == 1:
+            # 1bit: mu-shift binary + per-group beta 스케일
+            Wq = dequant_1bit_mu_beta(W, gs)
+            E_tilde = (W - Wq) * sqrt_diag.unsqueeze(0)
+            qmode = "1bit_mu_beta"
+            del Wq
+
+        elif b == 2:
+            Wq_l = dequant_2bit_lloyd2_sym(W, gs, clip_pct, lloyd_steps)
+            Wq_z = dequant_2bit_qtr_zero(W, gs, clip_pct, qtr_steps)
 
             El = (W - Wq_l) * sqrt_diag.unsqueeze(0)
             Ez = (W - Wq_z) * sqrt_diag.unsqueeze(0)
@@ -491,7 +585,7 @@ def measure_alpha_for_layer(
 
         elif b in (3, 4):
             Wq = dequant_uniform_asym(
-                W, b=b, group_size=group_size, clip_pct=0.0, rounding=uniform_rounding
+                W, b=b, group_size=gs, clip_pct=0.0, rounding=uniform_rounding
             )
             E_tilde = (W - Wq) * sqrt_diag.unsqueeze(0)
             qmode = f"{b}bit_uniform"
@@ -511,12 +605,13 @@ def measure_alpha_for_layer(
             del E_tilde, s, s2
             continue
 
-        r_eff = min(rank_r, s.numel())
+        r_eff = min(r_target, s.numel())
         tail = 0.0 if r_eff >= s.numel() else float(s2[r_eff:].sum().item())
         alpha = max(0.0, min(1.0, tail / Lq))
         out.append((b, qmode, Lq, tail, alpha))
 
         del E_tilde, s, s2
+
 
     return out
 
@@ -563,9 +658,23 @@ def main():
     ap.add_argument("--calib_cache_dir", type=str, default="./artifacts/bitmin")
 
     # α 측정 설정
-    ap.add_argument("--bits", type=int, nargs="+", default=[2, 3, 4])
+    ap.add_argument("--bits", type=int, nargs="+", default=[1, 2, 3, 4])
     ap.add_argument("--rank", type=int, default=64)
     ap.add_argument("--group_size", type=int, default=128)
+
+    # [추가] bit별 rank / group_size 매핑
+    ap.add_argument(
+        "--rank_map",
+        type=str,
+        default="1:64,2:128,3:64,4:32",
+        help='bit별 rank 지정. 예: "1:64,2:128,3:64,4:32" (콤마/공백 구분 가능)',
+    )
+    ap.add_argument(
+        "--group_size_map",
+        type=str,
+        default="1:16,2:32,3:64,4:128",
+        help='bit별 group_size 지정. 예: "1:16,2:32,3:64,4:128" (콤마/공백 구분 가능)',
+    )
 
     # 2/3/4비트 세부 옵션
     ap.add_argument("--clip_percentile", type=float, default=99.9,
@@ -649,10 +758,23 @@ def main():
         torch.save({"cov_ops": cov_ops, "meta": meta}, calib_path)
         print(f"[Step2] Saved Σ_x^{1/2} cache: {calib_path}")
 
+    # bit별 map 파싱
+    rank_map = _parse_int_map(args.rank_map)
+    group_size_map = _parse_int_map(args.group_size_map)
+    # 누락 bit는 --rank/--group_size 기본값으로 fallback
+    for b in args.bits:
+        if int(b) not in rank_map:
+            rank_map[int(b)] = int(args.rank)
+        if int(b) not in group_size_map:
+            group_size_map[int(b)] = int(args.group_size)
+
+    print(f"[Step2] rank_map={rank_map} (default_rank={args.rank})")
+    print(f"[Step2] group_size_map={group_size_map} (default_group_size={args.group_size})")
+
     # CSV 준비(스트리밍 작성)
-    csv_path = os.path.join(args.output_dir, f"alpha_layerwise_rank{args.rank}.csv")
-    qmode_csv_path = os.path.join(args.output_dir, f"alpha_2bit_qmode_rank{args.rank}.csv")
-    qmode_summary_path = os.path.join(args.output_dir, f"alpha_2bit_qmode_rank{args.rank}_summary.csv")
+    # rank/group_size가 bit마다 달라질 수 있으므로 파일명은 'rankvar'로 표기
+    csv_path = os.path.join(args.output_dir, f"alpha_layerwise_rankvar.csv")
+    qmode_csv_path = os.path.join(args.output_dir, f"alpha_2bit_qmode_rankvar.csv")
 
     fieldnames_main = [
         "full_name", "module", "m", "n", "bit", "qmode", "rank", "group_size",
@@ -660,8 +782,6 @@ def main():
     ]
     fieldnames_2bit = ["full_name", "module", "bit", "qmode", "Lq_weighted", "Lres_weighted", "alpha"]
 
-    # 2bit summary 집계용
-    qmode_counts = Counter()
 
     # top/bot 출력용(가벼운 메타만 저장)
     alpha_samples = []  # (alpha_float, full_name, bit, qmode)
@@ -720,8 +840,10 @@ def main():
                 W=W,
                 sqrt_diag=sqrt_diag,
                 bits=args.bits,
-                rank_r=args.rank,
-                group_size=args.group_size,
+                rank_map=rank_map,
+                group_size_map=group_size_map,
+                default_rank=args.rank,
+                default_group_size=args.group_size,
                 clip_pct=args.clip_percentile,
                 lloyd_steps=args.lloyd_steps,
                 qtr_steps=args.qtr_steps,
@@ -729,6 +851,9 @@ def main():
             )
 
             for b, qmode, Lq, Lres, alpha in results:
+                # bit별 실제 사용값 (csv에 기록)
+                rank_used = int(rank_map.get(int(b), args.rank))
+                group_used = int(group_size_map.get(int(b), args.group_size))
                 row = {
                     "full_name": full_name,
                     "module": mod_name,
@@ -736,8 +861,8 @@ def main():
                     "n": n,
                     "bit": b,
                     "qmode": qmode,
-                    "rank": args.rank,
-                    "group_size": args.group_size,
+                    "rank": rank_used,
+                    "group_size": group_used,
                     "Lq_weighted": f"{Lq:.6e}",
                     "Lres_weighted": f"{Lres:.6e}",
                     "alpha": f"{alpha:.8f}",
@@ -756,7 +881,6 @@ def main():
                         "Lres_weighted": f"{Lres:.6e}",
                         "alpha": f"{alpha:.8f}",
                     })
-                    qmode_counts[qmode] += 1
 
             processed += 1
 
@@ -769,14 +893,6 @@ def main():
     print(f"[Step2] Saved CSV: {csv_path}")
     print(f"[Step2] Saved 2-bit qmode CSV: {qmode_csv_path}")
 
-    # 2-bit qmode summary
-    if qmode_counts:
-        with open(qmode_summary_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["qmode", "count"])
-            writer.writeheader()
-            for qmode, c in sorted(qmode_counts.items()):
-                writer.writerow({"qmode": qmode, "count": c})
-        print(f"[Step2] Saved 2-bit qmode summary: {qmode_summary_path}")
 
     # 상위/하위 α 레이어 간단 프린트
     try:

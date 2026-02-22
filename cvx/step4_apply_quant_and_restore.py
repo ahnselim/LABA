@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # -*- coding: utf-8 -*-
 
 """
@@ -32,27 +31,32 @@ Step 4 — Apply Layerwise Quantization (2/3/4bit) and Low-rank Restore (A,B)
 
 예시:
 
-CUDA_VISIBLE_DEVICES=0 python step4_apply_quant_and_restore.py \
+CUDA_VISIBLE_DEVICES=3 python step4_apply_quant_and_restore.py \
   --model_id meta-llama/Llama-3.2-3B \
-  --bit_assign_csv ./artifacts/bitmin/step3b_budget/bit_assign.csv \
-  --out_dir ./artifacts/bitmin/step4_budget \
-  --rank 64 --group_size 128 \
+  --bit_assign_csv ./artifacts/bitmin/step3_budget_bit2/bit_assign.csv \
+  --out_dir ./artifacts/bitmin/step4_budget_bit2 \
+  --group_size_1 16  --rank_1 256 \
+  --group_size_2 32  --rank_2 128 \
+  --group_size_3 64  --rank_3 64  \
+  --group_size_4 128 --rank_4 32  \
   --dataset DKYoon/SlimPajama-6B --nsamples 64 --seqlen 2048 \
   --dtype bf16 --device cuda \
-  --reuse_calib \
-  --calib_cache_dir ./artifacts/bitmin \
+  --reuse_calib --calib_cache_dir ./artifacts/bitmin \
   --trust_remote_code
 
-CUDA_VISIBLE_DEVICES=1 python step4_apply_quant_and_restore.py \
+CUDA_VISIBLE_DEVICES=3 python step4_apply_quant_and_restore.py \
   --model_id meta-llama/Llama-3.2-3B \
-  --bit_assign_csv ../artifacts/montecarlo/step3c_dart/bit_assign.csv \
-  --out_dir ../artifacts/montecarlo/step4_budget \
-  --rank 64 --group_size 128 \
+  --bit_assign_csv ./artifacts/bitmin/step3_budget_g128/bit_assign.csv \
+  --out_dir ./artifacts/bitmin/step4_g128 \
+  --group_size_1 128  --rank_1 64 \
+  --group_size_2 128  --rank_2 64 \
+  --group_size_3 128  --rank_3 64 \
+  --group_size_4 128 --rank_4 64 \
   --dataset DKYoon/SlimPajama-6B --nsamples 64 --seqlen 2048 \
   --dtype bf16 --device cuda \
-  --reuse_calib \
-  --calib_cache_dir ../artifacts/montecarlo/cache \
+  --reuse_calib --calib_cache_dir ./artifacts/bitmin \
   --trust_remote_code
+
 
 """
 
@@ -63,6 +67,31 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+
+def _gs_for_bit(bit: int, args) -> int:
+    """bit별 group_size 선택 (없으면 global group_size fallback)"""
+    if bit == 1 and getattr(args, "group_size_1", None) is not None:
+        return int(args.group_size_1)
+    if bit == 2 and getattr(args, "group_size_2", None) is not None:
+        return int(args.group_size_2)
+    if bit == 3 and getattr(args, "group_size_3", None) is not None:
+        return int(args.group_size_3)
+    if bit == 4 and getattr(args, "group_size_4", None) is not None:
+        return int(args.group_size_4)
+    return int(args.group_size)
+
+
+def _rank_for_bit(bit: int, args) -> int:
+    """bit별 SVD rank 선택 (없으면 global rank fallback)"""
+    if bit == 1 and getattr(args, "rank_1", None) is not None:
+        return int(args.rank_1)
+    if bit == 2 and getattr(args, "rank_2", None) is not None:
+        return int(args.rank_2)
+    if bit == 3 and getattr(args, "rank_3", None) is not None:
+        return int(args.rank_3)
+    if bit == 4 and getattr(args, "rank_4", None) is not None:
+        return int(args.rank_4)
+    return int(args.rank)
 
 
 # -------------------------------
@@ -642,6 +671,44 @@ def dequant_uniform_asym(
         deq[flat] = minv[flat].unsqueeze(-1)
     return _from_groups(deq, orig_I).to(dtype=W.dtype, device=W.device)
 
+@torch.no_grad()
+def dequant_1bit_mu_beta(W: torch.Tensor, group_size: int):
+    """
+    1bit quantization (binary with global mu shift + per-group beta)
+
+    스텝:
+      1) beta (per-group scale):
+         - W를 group_size=k로 나누고
+         - 각 그룹에서 beta = mean(abs(W_ij))
+      2) mu (global mean):
+         - 전체 weight의 평균 mu = mean(W)
+      3) sign:
+         - W_center = W - mu
+         - W_center < 0 → -1, W_center > 0 → +1 (0은 +1로 취급)
+      4) dequant:
+         - 각 그룹에 대해 W_hat = sign * beta
+    """
+    # float32로 변환
+    W32 = W.to(torch.float32)
+
+    # (1) beta: 원본 W 기준으로 그룹별 평균 |W|
+    Wg_orig, O_, G, S, orig_I = _to_groups(W32, group_size)
+    beta = Wg_orig.abs().mean(dim=-1, keepdim=True)  # [O_, G, 1]
+
+    # (2) mu: 레이어 전체 평균
+    mu = W32.mean()
+
+    # (3) sign: (W - mu)를 기준으로 binary 부호 결정
+    W_center = W32 - mu
+    Wg_center, _, _, _, _ = _to_groups(W_center, group_size)
+    sgn = torch.sign(Wg_center)
+    sgn[sgn == 0] = 1.0  # 0은 +1 처리
+
+    # (4) dequant: sign * beta
+    deq_g = sgn * beta  # [O_, G, S]
+    deq = _from_groups(deq_g, orig_I)
+
+    return deq.to(dtype=W.dtype, device=W.device)
 
 # -------------------------------
 # 선택 비트 로드 (Step3 산출물)
@@ -673,7 +740,7 @@ def load_selected_bits(csv_path: str) -> Dict[str, int]:
                         pass
             if b is None:
                 continue
-            b = max(2, min(4, b))  # 2~4 클램프
+            b = max(1, min(4, b))  # 1~4 클램프
             sel[name] = b
     return sel
 
@@ -715,10 +782,22 @@ def main():
         required=True,
         help="Step3 bit_assign.csv (layer_name,R_int)",
     )
+    # (하위호환) global 기본값
     ap.add_argument("--group_size", type=int, default=128)
+    # bit별 group_size (Step2처럼 bit에 따라 다르게)
+    ap.add_argument("--group_size_1", type=int, default=16, help="1-bit group size (default: 16)")
+    ap.add_argument("--group_size_2", type=int, default=32, help="2-bit group size (default: 32)")
+    ap.add_argument("--group_size_3", type=int, default=64, help="3-bit group size (default: 64)")
+    ap.add_argument("--group_size_4", type=int, default=128, help="4-bit group size (default: 128)")
 
     # 복원(AB)
+    # (하위호환) global 기본값
     ap.add_argument("--rank", type=int, default=64)
+    # bit별 rank (Step2처럼 bit에 따라 다르게)
+    ap.add_argument("--rank_1", type=int, default=64, help="1-bit SVD rank (default: 64)")
+    ap.add_argument("--rank_2", type=int, default=128, help="2-bit SVD rank (default: 128)")
+    ap.add_argument("--rank_3", type=int, default=64, help="3-bit SVD rank (default: 64)")
+    ap.add_argument("--rank_4", type=int, default=32, help="4-bit SVD rank (default: 32)")
 
     # 캘리브레이션(Σ_x)
     ap.add_argument("--dataset", type=str, default="DKYoon/SlimPajama-6B")
@@ -907,9 +986,13 @@ def main():
         if bit is None:
             continue
 
-        if bit < 2 or bit > 4:
-            print(f"[warn] Unsupported bit={bit} at {mod_name}; clamped to [2,4].")
-            bit = max(2, min(4, bit))
+        if bit < 1 or bit > 4:
+            print(f"[warn] Unsupported bit={bit} at {mod_name}; clamped to [1,4].")
+            bit = max(1, min(4, bit))
+
+        # bit별 정책 적용
+        gs = _gs_for_bit(bit, args)
+        rk = _rank_for_bit(bit, args)
 
         if mod_name not in cov_ops:
             print(f"[warn] Σ_x not found for {mod_name}; skipping.")
@@ -933,13 +1016,17 @@ def main():
 
         inv_sqrt_diag = inv_sqrt_diag.to(device=device0)
 
-        # -------- (1) 양자화: 2bit 자동선택, 3/4bit uniform --------
-        if bit == 2:
+        # -------- (1) 양자화: bit별 group_size 적용 --------
+        if bit == 1:
+            # 1bit: mu-shift binary + per-group beta 스케일
+            Wq = dequant_1bit_mu_beta(W, gs)
+ 
+        elif bit == 2:
             Wq_l = dequant_2bit_lloyd2_sym(
-                W, args.group_size, args.clip_percentile, args.lloyd_steps
+                W, gs, args.clip_percentile, args.lloyd_steps
             )
             Wq_z = dequant_2bit_qtr_zero(
-                W, args.group_size, args.clip_percentile, args.qtr_steps
+                W, gs, args.clip_percentile, args.qtr_steps
             )
 
             # weighted Frobenius
@@ -956,15 +1043,15 @@ def main():
             Wq = dequant_uniform_asym(
                 W,
                 b=bit,
-                group_size=args.group_size,
+                group_size=gs,
                 clip_pct=0.0,
                 rounding=args.uniform_rounding,
             )
 
         qweights[full_name] = Wq.detach().to(torch.float16).cpu()
 
-        # -------- (2) 복원(AB): SVD(E Σ^{1/2}) rank-r --------
-        r_eff = min(args.rank, min(m, n))
+        # -------- (2) 복원(AB): bit별 rank 적용 --------
+        r_eff = min(rk, min(m, n))
         E = W - Wq.to(dtype=W.dtype, device=W.device)
         E_tilde = E * sqrt_diag.unsqueeze(0)  # (m,n)
 

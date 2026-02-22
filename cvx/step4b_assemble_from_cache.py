@@ -46,7 +46,8 @@ def load_bits_csv(path: str):
                     try: b = int(float(row[key])); break
                     except: pass
             if b is None: continue
-            mapping[name] = max(2, min(4, b))
+            # 1~4bit 허용 (이전 버전은 2~4bit만 허용했음)
+            mapping[name] = max(1, min(4, b))
     if not mapping:
         raise ValueError("No rows in bit_assign_csv")
     return mapping

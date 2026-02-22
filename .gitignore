@@ -1,0 +1,61 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Compiled extensions / native build products
+raq_kernel/build/
+*.so
+*.pyd
+*.dll
+*.dylib
+*.o
+*.a
+*.obj
+
+# Build / packaging directories
+build/
+dist/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# Virtual environments / local config
+.venv/
+.env
+.envrc
+*.env
+
+# Generated datasets, checkpoints, logs, and caches
+artifacts*/
+artifacts_*/
+prebake*/
+cache/
+hf_cache/
+data/
+downloads/
+logs/
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.onnx
+*.tar
+*.tgz
+*.tmp
+*.log
+*.jsonl
+
+# CSV search results (always regenerated)
+*.csv
+
+# Misc
+*.out
+.DS_Store
+Thumbs.db
+*.json
+
+*output*
+*logs*

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Step 4 (Prebake) — For every target Linear layer, compute and SAVE Wq and (A,B)
-for bits ∈ {2,3,4} into per-module files.
+for bits ∈ {1,2,3,4} into per-module files.
 
 • Step2에서 저장한 Σ_x^{1/2} 캐시(.pt) 재사용 지원: --reuse_calib --calib_cache_dir
   파일명 규칙:
@@ -12,22 +12,24 @@ for bits ∈ {2,3,4} into per-module files.
 출력 디렉토리 구조 (예):
 prebake_root/
   meta.json
-  bit2/
+  bit1/
     model_layers_0_self_attn_q_proj.pt  # {"module": "...", "full_weight": "...weight", "Wq": Tensor(fp16,CPU), "A": Tensor(fp16,CPU), "B": Tensor(fp16,CPU), "meta": {...}}
+  bit2/
   bit3/
   bit4/
 
 사용 예:
-CUDA_VISIBLE_DEVICES=1 \
-python step4_prebake_quant_and_ab.py \
+CUDA_VISIBLE_DEVICES=2 python step4_prebake_quant_and_ab.py \
   --model_id meta-llama/Llama-3.2-3B \
-  --rank 64 --group_size 128 \
+  --rank_1 256 --rank_2 128 --rank_3 64 --rank_4 32 \
+  --group_size_1 16 --group_size_2 32 --group_size_3 64 --group_size_4 128 \
   --dataset DKYoon/SlimPajama-6B --nsamples 64 --seqlen 2048 \
   --dtype bf16 --device cuda \
   --reuse_calib \
-  --calib_cache_dir ./artifacts/bitmin \
+  --calib_cache_dir ../artifacts/bitmin \
   --trust_remote_code \
-  --out_root ./artifacts/bitmin/prebake_llama3_3b_r64_g128
+  --out_root ../artifacts/bitmin/prebake_dyn
+
 """
 
 import os, re, gc, json, argparse, time
@@ -67,6 +69,32 @@ def is_target_weight(name: str, tensor: torch.Tensor) -> bool:
 
 def module_name_from_weight(full_weight_name: str) -> str:
     return full_weight_name[: -len(".weight")]
+
+
+def _gs_for_bit(bit: int, args) -> int:
+    """bit별 group_size 선택 (없으면 global group_size fallback)"""
+    if bit == 1 and getattr(args, "group_size_1", None) is not None:
+        return int(args.group_size_1)
+    if bit == 2 and getattr(args, "group_size_2", None) is not None:
+        return int(args.group_size_2)
+    if bit == 3 and getattr(args, "group_size_3", None) is not None:
+        return int(args.group_size_3)
+    if bit == 4 and getattr(args, "group_size_4", None) is not None:
+        return int(args.group_size_4)
+    return int(args.group_size)
+
+
+def _rank_for_bit(bit: int, args) -> int:
+    """bit별 SVD rank 선택 (없으면 global rank fallback)"""
+    if bit == 1 and getattr(args, "rank_1", None) is not None:
+        return int(args.rank_1)
+    if bit == 2 and getattr(args, "rank_2", None) is not None:
+        return int(args.rank_2)
+    if bit == 3 and getattr(args, "rank_3", None) is not None:
+        return int(args.rank_3)
+    if bit == 4 and getattr(args, "rank_4", None) is not None:
+        return int(args.rank_4)
+    return int(args.rank)
 
 
 def _safe_name(s) -> str:
@@ -240,6 +268,45 @@ def _pct_clip_lastdim(X: torch.Tensor, lo_pct: float, hi_pct: float) -> torch.Te
 
 # ---------- Quantization (Step4와 동일 규칙) ----------
 @torch.no_grad()
+def dequant_1bit_mu_beta(W: torch.Tensor, group_size: int):
+    """
+    1bit quantization (binary with global mu shift + per-group beta)
+
+    스텝:
+      1) beta (per-group scale):
+         - W를 group_size=k로 나누고
+         - 각 그룹에서 beta = mean(abs(W_ij))
+      2) mu (global mean):
+         - 전체 weight의 평균 mu = mean(W)
+      3) sign:
+         - W_center = W - mu
+         - W_center < 0 → -1, W_center > 0 → +1 (0은 +1로 취급)
+      4) dequant:
+         - 각 그룹에 대해 W_hat = sign * beta
+    """
+    # float32로 변환
+    W32 = W.to(torch.float32)
+
+    # (1) beta: 원본 W 기준 그룹별 평균 |W|
+    Wg_orig, O_, G, S, orig_I = _to_groups(W32, group_size)
+    beta = Wg_orig.abs().mean(dim=-1, keepdim=True)  # [O_, G, 1]
+
+    # (2) mu: 레이어 전체 평균
+    mu = W32.mean()
+
+    # (3) sign: (W - mu)를 기준으로 binary 부호 결정
+    W_center = W32 - mu
+    Wg_center, _, _, _, _ = _to_groups(W_center, group_size)
+    sgn = torch.sign(Wg_center)
+    sgn[sgn == 0] = 1.0  # 0은 +1 처리
+
+    # (4) dequant: sign * beta
+    deq_g = sgn * beta  # [O_, G, S]
+    deq = _from_groups(deq_g, orig_I)
+
+    return deq.to(dtype=W.dtype, device=W.device)
+
+@torch.no_grad()
 def dequant_2bit_lloyd2_sym(W: torch.Tensor, group_size: int, clip_pct=99.9, steps=4):
     W32 = W.to(torch.float32)
     Wg, O_, G, S, orig_I = _to_groups(W32, group_size)
@@ -320,7 +387,7 @@ def dequant_uniform_asym(
 # ---------- 메인 ----------
 def main():
     ap = argparse.ArgumentParser(
-        "Step 4 Prebake — Save Wq & (A,B) for bits 2/3/4 per module"
+        "Step 4 Prebake — Save Wq & (A,B) for bits 1/2/3/4 per module"
     )
     # 모델/장치
     ap.add_argument("--model_id", required=True)
@@ -333,9 +400,19 @@ def main():
     )
     ap.add_argument("--device", default="cuda")
 
-    # 프리베이크 하이퍼
+    # 프리베이크 하이퍼 (글로벌 + bit별 override)
     ap.add_argument("--rank", type=int, default=64)
     ap.add_argument("--group_size", type=int, default=128)
+    # bit별 group_size
+    ap.add_argument("--group_size_1", type=int, default=None, help="1-bit group size (override)")
+    ap.add_argument("--group_size_2", type=int, default=None, help="2-bit group size (override)")
+    ap.add_argument("--group_size_3", type=int, default=None, help="3-bit group size (override)")
+    ap.add_argument("--group_size_4", type=int, default=None, help="4-bit group size (override)")
+    # bit별 rank
+    ap.add_argument("--rank_1", type=int, default=None, help="1-bit SVD rank (override)")
+    ap.add_argument("--rank_2", type=int, default=None, help="2-bit SVD rank (override)")
+    ap.add_argument("--rank_3", type=int, default=None, help="3-bit SVD rank (override)")
+    ap.add_argument("--rank_4", type=int, default=None, help="4-bit SVD rank (override)")
 
     # Calibration/캐시 (Step2 규칙 재사용)
     ap.add_argument("--dataset", type=str, default="DKYoon/SlimPajama-6B")
@@ -478,11 +555,11 @@ def main():
     gc.collect()
 
     # bit 디렉토리 준비
-    for b in (2, 3, 4):
+    for b in (1, 2, 3, 4):
         (out_root / f"bit{b}").mkdir(parents=True, exist_ok=True)
 
-    # -------- per-layer × {2,3,4} 저장 --------
-    for full_name, W_cpu in tqdm(state.items(), desc="[Prebake] per-layer x {2,3,4}"):
+    # -------- per-layer × {1,2,3,4} 저장 --------
+    for full_name, W_cpu in tqdm(state.items(), desc="[Prebake] per-layer x {1,2,3,4}"):
         if not (full_name.endswith(".weight") and is_target_weight(full_name, W_cpu)):
             continue
         module = module_name_from_weight(full_weight_name=full_name)
@@ -496,9 +573,7 @@ def main():
         m, n = W.shape
         sqrt_diag = sqrt_diag.to(dev0)
         inv_sqrt = inv_sqrt.to(dev0)
-        r_eff_max = min(args.rank, min(m, n))
-
-        def _svd_ab(Wq: torch.Tensor):
+        def _svd_ab(Wq: torch.Tensor, r_eff_max: int):
             E = W - Wq.to(W.dtype)
             E_t = E * sqrt_diag.unsqueeze(0)
             try:
@@ -521,12 +596,31 @@ def main():
                 )
             return A, B
 
-        # 2-bit (두 후보 중 weighted Frobenius 작은 쪽)
+        # 1-bit (bit별 group_size / rank)
+        gs1 = _gs_for_bit(1, args)
+        r1 = min(_rank_for_bit(1, args), min(m, n))
+        Wq1 = dequant_1bit_mu_beta(W, gs1)
+        A1, B1 = _svd_ab(Wq1, r1)
+        torch.save(
+            {
+                "module": module,
+                "full_weight": full_name,
+                "Wq": Wq1.to(torch.float16).cpu(),
+                "A": A1,
+                "B": B1,
+                "meta": {"bit": 1},
+            },
+            out_root / "bit1" / f"{_safe_name(module)}.pt",
+        )
+
+        # 2-bit (두 후보 중 weighted Frobenius 작은 쪽, bit별 group_size / rank)
+        gs2 = _gs_for_bit(2, args)
+        r2 = min(_rank_for_bit(2, args), min(m, n))
         Wq_l = dequant_2bit_lloyd2_sym(
-            W, args.group_size, args.clip_percentile, args.lloyd_steps
+            W, gs2, args.clip_percentile, args.lloyd_steps
         )
         Wq_z = dequant_2bit_qtr_zero(
-            W, args.group_size, args.clip_percentile, args.qtr_steps
+            W, gs2, args.clip_percentile, args.qtr_steps
         )
         El = (W - Wq_l) * sqrt_diag.unsqueeze(0)
         Ez = (W - Wq_z) * sqrt_diag.unsqueeze(0)
@@ -534,7 +628,7 @@ def main():
             "lloyd2" if torch.linalg.norm(El) <= torch.linalg.norm(Ez) else "qtr_zero"
         )
         Wq2 = Wq_l if pick == "lloyd2" else Wq_z
-        A2, B2 = _svd_ab(Wq2)
+        A2, B2 = _svd_ab(Wq2, r2)
         torch.save(
             {
                 "module": module,
@@ -547,9 +641,11 @@ def main():
             out_root / "bit2" / f"{_safe_name(module)}.pt",
         )
 
-        # 3-bit
-        Wq3 = dequant_uniform_asym(W, 3, args.group_size, 0.0, args.uniform_rounding)
-        A3, B3 = _svd_ab(Wq3)
+        # 3-bit (bit별 group_size / rank)
+        gs3 = _gs_for_bit(3, args)
+        r3 = min(_rank_for_bit(3, args), min(m, n))
+        Wq3 = dequant_uniform_asym(W, 3, gs3, 0.0, args.uniform_rounding)
+        A3, B3 = _svd_ab(Wq3, r3)
         torch.save(
             {
                 "module": module,
@@ -562,9 +658,11 @@ def main():
             out_root / "bit3" / f"{_safe_name(module)}.pt",
         )
 
-        # 4-bit
-        Wq4 = dequant_uniform_asym(W, 4, args.group_size, 0.0, args.uniform_rounding)
-        A4, B4 = _svd_ab(Wq4)
+        # 4-bit (bit별 group_size / rank)
+        gs4 = _gs_for_bit(4, args)
+        r4 = min(_rank_for_bit(4, args), min(m, n))
+        Wq4 = dequant_uniform_asym(W, 4, gs4, 0.0, args.uniform_rounding)
+        A4, B4 = _svd_ab(Wq4, r4)
         torch.save(
             {
                 "module": module,
@@ -596,7 +694,7 @@ def main():
         "seqlen": args.seqlen,
         "dtype": args.dtype,
         "created": int(time.time()),
-        "note": "Per-module prebaked Wq/A/B for bits 2/3/4; Σ_x cache reused if available.",
+        "note": "Per-module prebaked Wq/A/B for bits 1/2/3/4; Σ_x cache reused if available.",
     }
     with open(out_root / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

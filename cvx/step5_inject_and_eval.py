@@ -17,12 +17,12 @@ Step 5 — Inject Wq + Layerwise A/B, then evaluate PPL (robust matching)
  3) WikiText-2(raw) test로 PPL 2종 측정: Quant-only(α=0), Quant+AB(α=--alpha_svd)
 
 사용 예:
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=3 \
 python step5_inject_and_eval.py \
   --model_name meta-llama/Llama-3.2-3B \
-  --quantized_weights_path ../artifacts/montecarlo/step4_budget/quantized_weights.pt \
-  --correction_path ../artifacts/montecarlo/step4_budget/correction_layerwise.pt \
-  --bmap_path ../artifacts/montecarlo/step4_budget/b_ref_map_layerwise.json \
+  --quantized_weights_path ./artifacts/bitmin/step4_g128/quantized_weights.pt \
+  --correction_path ./artifacts/bitmin/step4_g128/correction_layerwise.pt \
+  --bmap_path ./artifacts/bitmin/step4_g128/b_ref_map_layerwise.json \
   --alpha_svd 1.0 \
   --device cuda:0 \
   --trust_remote_code \
@@ -217,7 +217,8 @@ def patch_ab_from_corrections(
             f"[AB] filtering by bmap: {len(filter_modules)} keys → {len(target_modules)} targets"
         )
 
-    patched, missing_module = 0, 0
+    patched, missing_module, shape_mismatch = 0, 0, 0
+    rank_hist = {}
     examples = []
     for base in sorted(target_modules):
         try:
@@ -240,12 +241,27 @@ def patch_ab_from_corrections(
             continue
 
         A, B = pairs[base]
+
+        # shape check
+        out_f = inner.out_features
+        in_f = inner.in_features
+        if (A.ndim != 2) or (B.ndim != 2):
+            shape_mismatch += 1
+            continue
+        if (A.shape[0] != out_f) or (B.shape[1] != in_f) or (A.shape[1] != B.shape[0]):
+            shape_mismatch += 1
+            continue
+
+        r = int(A.shape[1])
+        rank_hist[r] = rank_hist.get(r, 0) + 1
         setattr(parent, attr, AddABCorrection(inner, A, B, alpha_svd=alpha_svd))
         patched += 1
         if len(examples) < 3:
             examples.append((base, tuple(A.shape), tuple(B.shape)))
 
-    print(f"[AB] patched={patched}, missing_module={missing_module}")
+    print(f"[AB] patched={patched}, missing_module={missing_module}, shape_mismatch={shape_mismatch}")
+    if rank_hist:
+        print(f"[AB] rank histogram: {dict(sorted(rank_hist.items()))}")
     if examples:
         print("[AB] examples:", examples)
     return patched
@@ -336,16 +352,8 @@ def main():
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.model_max_length = 10**9  # 경고 억제(길이 제한)
-
-    # 2) 양자화 가중치 주입
-    print(f"[Load] Wq: {args.quantized_weights_path}")
-    try:
-        qweights = torch.load(args.quantized_weights_path, map_location="cpu")
-    except TypeError:
-        qweights = torch.load(args.quantized_weights_path, map_location="cpu")
-    apply_quantized_weights(model, qweights)
-
-    # 3) AB 로드 및 패치
+    
+    # 2) AB 로드 및 패치 (먼저 래핑)
     print(f"[Load] corrections: {args.correction_path}")
     try:
         correction = torch.load(args.correction_path, map_location="cpu")
@@ -356,7 +364,6 @@ def main():
     if args.bmap_path and os.path.exists(args.bmap_path):
         with open(args.bmap_path, "r") as f:
             bmap = json.load(f)
-        # 값은 무시, 키만 필터로 사용
         bmap_keys = set(bmap.keys())
         print(f"[bmap] keys loaded: {len(bmap_keys)}")
 
@@ -368,6 +375,15 @@ def main():
         patched = patch_ab_from_corrections(
             model, correction, set(), alpha_svd=args.alpha_svd
         )
+
+    # 3) 양자화 가중치 주입 (래핑 이후에 하면 항상 inner로 들어감)
+    print(f"[Load] Wq: {args.quantized_weights_path}")
+    try:
+        qweights = torch.load(args.quantized_weights_path, map_location="cpu")
+    except TypeError:
+        qweights = torch.load(args.quantized_weights_path, map_location="cpu")
+    apply_quantized_weights(model, qweights)
+
 
     # 4) 평가
     # 4-1) Quant-only
