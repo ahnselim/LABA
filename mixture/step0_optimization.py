@@ -43,14 +43,19 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 
-# Enable `from joint...` import when running as script from arbitrary cwd.
+# Enable local imports when running as script from arbitrary cwd.
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-from joint.step0_1_quantize import Step01QuantizeConfig, run as run_step01
-from joint.step0_2_calib import Step02CalibConfig, run as run_step02
-from joint.step0_3_BO_opt import Step03BOConfig, run as run_step03
+if __package__:
+    from .joint.step0_1_quantize import Step01QuantizeConfig, run as run_step01
+    from .joint.step0_2_calib import Step02CalibConfig, run as run_step02
+    from .joint.step0_3_BO_opt import Step03BOConfig, run as run_step03
+else:
+    from joint.step0_1_quantize import Step01QuantizeConfig, run as run_step01
+    from joint.step0_2_calib import Step02CalibConfig, run as run_step02
+    from joint.step0_3_BO_opt import Step03BOConfig, run as run_step03
 
 
 def _safe_name(s) -> str:

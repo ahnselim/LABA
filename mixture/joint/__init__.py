@@ -1,2 +1,1 @@
-"""Wrappers for integrating LABA/joint step scripts into mixture step0 pipeline."""
-
+"""Standalone joint step scripts with compatibility wrapper APIs for mixture step0."""
