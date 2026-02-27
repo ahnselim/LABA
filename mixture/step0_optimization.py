@@ -16,16 +16,26 @@ Output (step4_prebake-compatible layout):
     best_raw/bit{b}/lowrank_uv_ab_best.pt
     summaries/*.json
   
-CUDA_VISIBLE_DEVICES=1 nohup \
+CUDA_VISIBLE_DEVICES=2 nohup \
 python step0_optimization.py \
-  --model_id meta-llama/Llama-3.2-3B \
-  --out_root ./output/output_step0_prebake \
+  --model_id huggyllama/llama-7b \
+  --out_root ./output_7b/output_step0_prebake \
   --group_size_1 128 --group_size_2 128 --group_size_3 128 --group_size_4 128 \
   --rank_ab_1 64 --rank_ab_2 64 --rank_ab_3 64 --rank_ab_4 64 \
   --stage1_max_blocks 8 --stage1_n_trials 20 \
   --nsamples 64 --seq_len 2048 \
   --trust_remote_code > ./logs/step0.log 2>&1 &
 
+CUDA_VISIBLE_DEVICES=3 nohup \
+python step0_optimization.py \
+  --model_id huggyllama/llama-7b \
+  --out_root ./output_7b/output_step0_prebake \
+  --group_size_4 128 \
+  --rank_ab_4 64 \
+   --bits 4 \
+  --stage1_max_blocks 8 --stage1_n_trials 20 \
+  --nsamples 64 --seq_len 2048 \
+  --trust_remote_code > ./logs/step0_4bit.log 2>&1 &
 """
 
 from __future__ import annotations

@@ -3,6 +3,7 @@
 """
 Integrated mixture Monte-Carlo pipeline:
   step2_1_warmup -> step2_2_fintune_mixer
+  (+ auto-build surrogate static_info when missing)
 
 This wraps the copied mixer scripts under `LABA/mixture/mc` and wires
 step2_1 artifacts into step2_2 automatically.
@@ -13,11 +14,11 @@ CUDA_VISIBLE_DEVICES=3 nohup python step2_montecarlo.py \
   --sens_csv ./output/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
   --alpha_csv ./output/output_step1_cvx/step1_2/alpha_layerwise_prebake.csv \
   --prebake_root ./output/output_step0_prebake \
-  --surrogate_static_info ./output/static_info_v3/static_info_v3.json \
   --target_avg_bits 2.5 \
   --out_root ./output/output_step2_mc \
   --gpu_id 0 \
   --use_round_band \
+  --warmup_bits_lo 2.5 --warmup_bits_hi 3.0 \
   --round_quantum 0.1 > ./logs/step2_mc.log 2>&1 &
 
 Warmup(step2_1) 재사용하고 step2_2만 실행 : 
@@ -26,7 +27,6 @@ CUDA_VISIBLE_DEVICES=0 python LABA/mixture/step2_montecarlo.py \
   --sens_csv ./output/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
   --alpha_csv ./output/output_step1_cvx/step1_2/alpha_layerwise.csv \
   --prebake_root ./output/output_step0_prebake \
-  --surrogate_static_info ./output/static_info_v3.json \
   --target_avg_bits 2.6 \
   --out_root ./output/output_step2_mc \
   --skip_step2_1 \
@@ -50,9 +50,11 @@ if str(_THIS_DIR) not in sys.path:
 if __package__:
     from .mc import step2_1_warmup as mod_step21
     from .mc import step2_2_fintune_mixer as mod_step22
+    from .dataset import build_static_info_dynamic_alpha as mod_static_info
 else:
     from mc import step2_1_warmup as mod_step21
     from mc import step2_2_fintune_mixer as mod_step22
+    from dataset import build_static_info_dynamic_alpha as mod_static_info
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -66,6 +68,46 @@ def _require_exists(path_str: str, label: str) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"{label} not found: {p}")
     return p
+
+
+def _resolve_or_build_surrogate_static_info(
+    *,
+    requested_path: str,
+    out_root: Path,
+    sens_csv: Path,
+    alpha_csv: Path,
+    model_id: str,
+    avg_bits_target: float,
+) -> Path:
+    req = (requested_path or "").strip()
+    if req:
+        out_json = Path(req).expanduser().resolve()
+    else:
+        out_json = (out_root / "surrogate_static_info_auto" / "static_info_v3.json").resolve()
+
+    if out_json.exists():
+        print(f"[step2-mc] Reuse surrogate_static_info: {out_json}", flush=True)
+        return out_json
+
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_flat = out_json.parent / "alpha_table_flat.csv"
+    print(
+        "[step2-mc] surrogate_static_info missing -> auto-building "
+        f"from sens/alpha CSVs at {out_json}",
+        flush=True,
+    )
+    static_info, flat = mod_static_info.build_static_info(
+        sens_csv=str(sens_csv),
+        alpha_csv=str(alpha_csv),
+        model_id=model_id,
+        avg_bits_target=float(avg_bits_target),
+    )
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(static_info, f, ensure_ascii=False, indent=2)
+    flat.to_csv(out_flat, index=False)
+    print(f"[step2-mc] Built surrogate_static_info: {out_json}", flush=True)
+    print(f"[step2-mc] Built alpha_table_flat: {out_flat}", flush=True)
+    return out_json
 
 
 def _parser_dest_set(parser: argparse.ArgumentParser) -> set[str]:
@@ -114,7 +156,11 @@ def main() -> None:
     ap.add_argument("--sens_csv", required=True)
     ap.add_argument("--alpha_csv", required=True)
     ap.add_argument("--prebake_root", required=True)
-    ap.add_argument("--surrogate_static_info", required=True)
+    ap.add_argument(
+        "--surrogate_static_info",
+        default="",
+        help="Optional. If missing or file does not exist, build automatically from sens/alpha CSVs.",
+    )
     ap.add_argument("--target_avg_bits", type=float, required=True)
     ap.add_argument("--out_root", required=True)
 
@@ -195,10 +241,16 @@ def main() -> None:
     sens_csv = _require_exists(args.sens_csv, "sens_csv")
     alpha_csv = _require_exists(args.alpha_csv, "alpha_csv")
     prebake_root = _require_exists(args.prebake_root, "prebake_root")
-    surrogate_static_info = _require_exists(args.surrogate_static_info, "surrogate_static_info")
-
     out_root = Path(args.out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    surrogate_static_info = _resolve_or_build_surrogate_static_info(
+        requested_path=args.surrogate_static_info,
+        out_root=out_root,
+        sens_csv=sens_csv,
+        alpha_csv=alpha_csv,
+        model_id=args.model_id,
+        avg_bits_target=float(args.target_avg_bits),
+    )
     d21 = out_root / args.step2_1_dirname
     d22 = out_root / args.step2_2_dirname
     d21.mkdir(parents=True, exist_ok=True)
@@ -272,6 +324,19 @@ def main() -> None:
             },
         )
         _apply_kv_overrides(ns21, p21, args.step2_1_set, "step2_1")
+        print(
+            "[step2-mc] step2_1 config: "
+            f"warmup_gens={ns21.warmup_generations}, "
+            f"warmup_bits=[{float(ns21.warmup_bits_lo):.3f},{float(ns21.warmup_bits_hi):.3f}]/{ns21.warmup_bits_sampling}, "
+            f"sur_train_epochs={ns21.sur_train_epochs}, "
+            f"sur_train_pairs_per_gen={ns21.sur_train_pairs_per_gen}, "
+            f"sur_train_log_interval={ns21.sur_train_log_interval}",
+            flush=True,
+        )
+        print(
+            "[step2-mc] step2_1 will continue with offline surrogate training after warmup true-PPL evals.",
+            flush=True,
+        )
         res21 = mod_step21.run(ns21)
 
     if not summary_path.exists():

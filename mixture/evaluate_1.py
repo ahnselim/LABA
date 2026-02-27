@@ -25,7 +25,7 @@ python evaluate_1.py \
 
 CUDA_VISIBLE_DEVICES=1 \
 python evaluate_1.py \
-  --bit_assign_csv ./output/output_step1_cvx/step1_3/bit_assign.csv \
+  --bit_assign_csv ./output/output_step2_mc/step2_2/bit_assign.csv \
   --prebake_root ./output/output_step0_prebake \
   --model_name meta-llama/Llama-3.2-3B \
   --device cuda:0

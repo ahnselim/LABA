@@ -262,6 +262,17 @@ class OfflineSurrogateTrainer:
 
         best_metric = -1.0
         best_path = os.path.join(self.output_dir, "best.pt")
+        est_pairs_per_epoch = max(1, len(train_gens)) * int(self.args.sur_train_pairs_per_gen)
+        est_steps_per_epoch = int(math.ceil(est_pairs_per_epoch / max(1, int(self.args.sur_train_batch_size))))
+        print(
+            "[Trainer] train loop config: "
+            f"epochs={int(self.args.sur_train_epochs)} "
+            f"pairs_per_gen={int(self.args.sur_train_pairs_per_gen)} "
+            f"batch_size={int(self.args.sur_train_batch_size)} "
+            f"train_gens={len(train_gens)} "
+            f"est_steps/epoch≈{est_steps_per_epoch}",
+            flush=True,
+        )
         print("[Trainer] start", flush=True)
         global_step = 0
 
@@ -270,6 +281,7 @@ class OfflineSurrogateTrainer:
             t0 = time.time()
             run_loss = 0.0
             run_n = 0
+            print(f"[Trainer][Epoch {epoch}] train start", flush=True)
 
             for batch in train_loader:
                 bits_A = batch["bits_A"].to(self.device, non_blocking=True)
@@ -304,6 +316,11 @@ class OfflineSurrogateTrainer:
             dt = time.time() - t0
 
             model.eval()
+            print(
+                f"[Trainer][Epoch {epoch}] train done -> validation start "
+                f"(steps={global_step}, train_loss={avg_train_loss:.6f})",
+                flush=True,
+            )
             val_metrics = evaluate_ranking_metrics(
                 model=model,
                 gen2cands=gen2cands,
