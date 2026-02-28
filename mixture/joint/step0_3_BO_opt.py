@@ -319,115 +319,6 @@ def load_context(args: argparse.Namespace) -> dict:
     }
 
 
-def _tensor_nbytes(t: torch.Tensor) -> int:
-    return int(t.numel()) * int(t.element_size())
-
-
-def _entry_nbytes(entry: Dict[str, torch.Tensor]) -> int:
-    return sum(_tensor_nbytes(v) for v in entry.values())
-
-
-def _maybe_pin_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
-    if t.device.type != "cpu":
-        return t
-    try:
-        if t.is_pinned():
-            return t
-    except Exception:
-        return t
-    try:
-        return t.pin_memory()
-    except Exception:
-        return t
-
-
-def _make_host_layer_entry(ctx: dict, key: str, pin_memory: bool) -> Dict[str, torch.Tensor]:
-    entry = {
-        "w": ctx["state"][key].to(torch.float32),
-        "c": ctx["codebooks"][key].to(torch.float32),
-        "codes": ctx["qcodes"][key],
-        "s": ctx["calib_s"][key]["s"].to(torch.float32),
-    }
-    if pin_memory:
-        entry = {name: _maybe_pin_cpu_tensor(t) for name, t in entry.items()}
-    return entry
-
-
-def prepare_stage1_caches(ctx: dict, stage1_keys: List[str]) -> None:
-    if ctx.get("stage1_cache_ready"):
-        return
-
-    device = ctx["device"]
-    pin_memory = device.type == "cuda"
-    host_cache: Dict[str, Dict[str, torch.Tensor]] = {}
-    host_bytes = 0
-    for key in stage1_keys:
-        entry = _make_host_layer_entry(ctx, key, pin_memory=pin_memory)
-        host_cache[key] = entry
-        host_bytes += _entry_nbytes(entry)
-
-    ctx["stage1_host_cache"] = host_cache
-    ctx["stage1_key_set"] = set(stage1_keys)
-    ctx["stage1_gpu_cache"] = {}
-    ctx["stage1_cache_ready"] = True
-
-    print(
-        f"[V2] stage1 host cache ready: {len(host_cache)} matrices, "
-        f"{host_bytes / (1024**3):.2f} GiB"
-    )
-
-    if device.type != "cuda":
-        return
-
-    gpu_cache: Dict[str, Dict[str, torch.Tensor]] = {}
-    gpu_bytes = 0
-    try:
-        for key in stage1_keys:
-            src = host_cache[key]
-            gpu_entry = {
-                "w": src["w"].to(device, non_blocking=True),
-                "c": src["c"].to(device, non_blocking=True),
-                "codes": src["codes"].to(device, non_blocking=True),
-                "s": src["s"].to(device, non_blocking=True),
-            }
-            gpu_cache[key] = gpu_entry
-            gpu_bytes += _entry_nbytes(gpu_entry)
-        torch.cuda.synchronize(device=device)
-        ctx["stage1_gpu_cache"] = gpu_cache
-        print(
-            f"[V2] stage1 GPU cache enabled: {len(gpu_cache)} matrices, "
-            f"{gpu_bytes / (1024**3):.2f} GiB"
-        )
-    except RuntimeError as e:
-        if "out of memory" not in str(e).lower():
-            raise
-        print("[V2] stage1 GPU cache disabled (OOM). Falling back to pinned host prefetch.")
-        for entry in gpu_cache.values():
-            entry.clear()
-        gpu_cache.clear()
-        ctx["stage1_gpu_cache"] = {}
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
-def release_stage1_caches(ctx: dict) -> None:
-    released = False
-    for key in ("stage1_gpu_cache", "stage1_host_cache"):
-        cache = ctx.pop(key, None)
-        if isinstance(cache, dict):
-            for entry in cache.values():
-                if isinstance(entry, dict):
-                    entry.clear()
-            cache.clear()
-            released = True
-    ctx.pop("stage1_key_set", None)
-    ctx.pop("stage1_cache_ready", None)
-    if released:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
 def select_stage1_keys(keys_all: List[str], stage1_max_blocks: int) -> Tuple[List[str], List[int]]:
     if int(stage1_max_blocks) <= 0:
         raise ValueError("--stage1_max_blocks must be > 0")
@@ -492,24 +383,15 @@ def optimize_over_keys(
     save_artifacts: bool,
 ) -> float:
     device = ctx["device"]
+    codebooks = ctx["codebooks"]
+    qcodes_dict = ctx["qcodes"]
     metas = ctx["metas"]
-    is_cuda = (device.type == "cuda")
-    is_stage1 = trial_obj is not None
-    stage1_gpu_cache: Dict[str, Dict[str, torch.Tensor]] = ctx.get("stage1_gpu_cache", {}) if is_stage1 else {}
-    stage1_host_cache: Dict[str, Dict[str, torch.Tensor]] = ctx.get("stage1_host_cache", {}) if is_stage1 else {}
-    use_stage1_gpu_cache = bool(stage1_gpu_cache)
-    prefetch_stream = None
-    if is_cuda and not use_stage1_gpu_cache:
-        prefetch_stream = ctx.get("_h2d_prefetch_stream")
-        if prefetch_stream is None:
-            prefetch_stream = torch.cuda.Stream(device=device)
-            ctx["_h2d_prefetch_stream"] = prefetch_stream
+    calib_s = ctx["calib_s"]
+    state = ctx["state"]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     train_log_path = out_dir / "train_log.jsonl"
     log_f = open(train_log_path, "w", encoding="utf-8")
-    log_records_since_flush = 0
-    log_flush_every = 16
 
     delta_out: Dict[str, torch.Tensor] = {}
     uvab_out: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -521,71 +403,27 @@ def optimize_over_keys(
     best_by_layer: Dict[str, float] = {}
     report_step = 0
 
-    def get_host_entry(key_: str) -> Tuple[Dict[str, torch.Tensor], bool]:
-        if key_ in stage1_host_cache:
-            return stage1_host_cache[key_], True
-        return _make_host_layer_entry(ctx, key_, pin_memory=is_cuda), False
-
-    def launch_layer_transfer(key_: str) -> dict:
-        if key_ in stage1_gpu_cache:
-            return {"key": key_, "gpu": stage1_gpu_cache[key_], "prefetched": False, "host_ref": None}
-
-        host_entry, persistent = get_host_entry(key_)
-        if not is_cuda:
-            gpu_entry = {
-                "w": host_entry["w"].to(device),
-                "c": host_entry["c"].to(device),
-                "codes": host_entry["codes"].to(device),
-                "s": host_entry["s"].to(device),
-            }
-            return {
-                "key": key_,
-                "gpu": gpu_entry,
-                "prefetched": False,
-                "host_ref": (None if persistent else host_entry),
-            }
-
-        with torch.cuda.stream(prefetch_stream):
-            gpu_entry = {
-                "w": host_entry["w"].to(device, non_blocking=True),
-                "c": host_entry["c"].to(device, non_blocking=True),
-                "codes": host_entry["codes"].to(device, non_blocking=True),
-                "s": host_entry["s"].to(device, non_blocking=True),
-            }
-        return {
-            "key": key_,
-            "gpu": gpu_entry,
-            "prefetched": True,
-            "host_ref": (None if persistent else host_entry),
-        }
-
-    def acquire_layer_transfer(bundle: dict) -> Dict[str, torch.Tensor]:
-        if bundle.get("prefetched", False) and prefetch_stream is not None:
-            torch.cuda.current_stream(device=device).wait_stream(prefetch_stream)
-        return bundle["gpu"]
-
     try:
-        pending_transfer = launch_layer_transfer(keys[0]) if keys else None
         for li, key in enumerate(keys):
-            if pending_transfer is None or pending_transfer["key"] != key:
-                pending_transfer = launch_layer_transfer(key)
-            layer_tensors = acquire_layer_transfer(pending_transfer)
-            pending_transfer = launch_layer_transfer(keys[li + 1]) if (li + 1) < len(keys) else None
-
             meta = metas[key]
             bits = int(meta["bits"])
             gs = int(meta["group_size"])
             q_levels = int(meta["levels"])
             orig_i = int(tuple(meta["orig_shape"])[1])
 
-            w = layer_tensors["w"]
-            c = layer_tensors["c"]
-            codes = layer_tensors["codes"]
-            s = layer_tensors["s"]
+            w_cpu = state[key].to(torch.float32)
+            c_cpu = codebooks[key].to(torch.float32)
+            codes_cpu = qcodes_dict[key]
+            s_cpu = calib_s[key]["s"].to(torch.float32)
 
-            o, i = w.shape
+            o, i = w_cpu.shape
             if i != orig_i:
                 raise RuntimeError(f"shape mismatch on {key}: I={i}, orig_I={orig_i}")
+
+            w = w_cpu.to(device)
+            c = c_cpu.to(device)
+            codes = codes_cpu.to(device)
+            s = s_cpu.to(device)
 
             delta = torch.nn.Parameter(torch.zeros_like(c, dtype=torch.float32, device=device))
             u = torch.ones((o,), device=device, dtype=torch.float32)
@@ -600,10 +438,10 @@ def optimize_over_keys(
 
             wq = e = rw = None
             mse = float("inf")
+            dnorm = float("inf")
             best_mse = float("inf")
             best_outer = -1
             best_delta = best_a = best_b = best_u = best_v = best_wq = None
-            best_mse_t = torch.full((), float("inf"), dtype=torch.float32, device=device)
 
             try:
                 for outer in range(int(args.outer_loops)):
@@ -661,14 +499,13 @@ def optimize_over_keys(
 
                         m = a @ b
                         pred = (u.unsqueeze(1) * m) * v.unsqueeze(0)
-                        mse_t = torch.mean((rw - pred) ** 2)
-                        best_mse_t = torch.minimum(best_mse_t, mse_t.detach())
+                        mse = torch.mean((rw - pred) ** 2).item()
+                        dnorm = torch.mean(delta.detach() ** 2).item()
 
-                        if save_artifacts:
-                            mse = float(mse_t.item())
-                            if mse < best_mse:
-                                best_mse = float(mse)
-                                best_outer = int(outer)
+                        if mse < best_mse:
+                            best_mse = float(mse)
+                            best_outer = int(outer)
+                            if save_artifacts:
                                 best_delta = delta.detach().clone()
                                 best_a = a.detach().clone()
                                 best_b = b.detach().clone()
@@ -677,9 +514,6 @@ def optimize_over_keys(
                                 best_wq = wq.detach().clone()
 
                     if (outer % max(1, int(args.log_every))) == 0 or outer == int(args.outer_loops) - 1:
-                        if not save_artifacts:
-                            mse = float(mse_t.item())
-                        dnorm = float(torch.mean(delta.detach() ** 2).item())
                         rec = {
                             "trial": int(trial_number),
                             "layer_idx": li,
@@ -705,15 +539,11 @@ def optimize_over_keys(
                             },
                         }
                         log_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                        log_records_since_flush += 1
-                        if log_records_since_flush >= log_flush_every:
-                            log_f.flush()
-                            log_records_since_flush = 0
+                        log_f.flush()
 
-                    best_mse_for_key = float(best_mse if save_artifacts else best_mse_t.item())
                     prev = best_by_layer.get(key, None)
-                    if prev is None or best_mse_for_key < prev:
-                        best_by_layer[key] = best_mse_for_key
+                    if prev is None or best_mse < prev:
+                        best_by_layer[key] = float(best_mse)
 
                     if enable_prune and trial_obj is not None and len(best_by_layer) >= int(args.prune_min_layers):
                         report_step += 1
@@ -793,8 +623,9 @@ def optimize_over_keys(
                     del e
                 if rw is not None:
                     del rw
-                if not use_stage1_gpu_cache:
-                    layer_tensors.clear()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
 
         if save_artifacts:
             flush_outputs(
@@ -807,8 +638,6 @@ def optimize_over_keys(
                 wdq_best_out=wdq_best_out,
             )
     finally:
-        if log_records_since_flush > 0:
-            log_f.flush()
         log_f.close()
 
     if not best_by_layer:
@@ -925,7 +754,6 @@ def main() -> None:
     print(f"[V2] stage1 blocks: {stage1_blocks}")
     print(f"[V2] stage1 matrices: {len(stage1_keys)}")
     print(f"[V2] stage2 matrices(full): {len(keys_all)}")
-    prepare_stage1_caches(ctx, stage1_keys)
 
     trials_log = stage1_dir / "trials.jsonl"
     sampler = optuna.samplers.TPESampler(seed=int(args.seed))
@@ -1014,7 +842,7 @@ def main() -> None:
         objective,
         n_trials=int(args.stage1_n_trials),
         timeout=(None if int(args.stage1_timeout_sec) <= 0 else int(args.stage1_timeout_sec)),
-        gc_after_trial=False,
+        gc_after_trial=True,
     )
 
     completed = [t for t in study.trials if t.state == TrialState.COMPLETE and t.value is not None]
@@ -1049,9 +877,6 @@ def main() -> None:
     print("[V2] stage1 done")
     print(f"  best trial: {best_trial.number}")
     print(f"  best params: {best_params}")
-
-    # Stage1 캐시를 해제해 Stage2 전체 레이어 최적화에 GPU 메모리를 비운다.
-    release_stage1_caches(ctx)
 
     t_stage2 = time.time()
     stage2_obj = optimize_over_keys(
@@ -1100,10 +925,6 @@ def main() -> None:
     }
     with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(final_summary, f, ensure_ascii=False, indent=2)
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     print("✅ Step3.5 V2 finished")
     print(f"  run_dir: {run_dir}")

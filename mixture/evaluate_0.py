@@ -18,11 +18,11 @@ This script converts those prebake shards back into:
   - low_rank_ab dict: { "<module>.weight": {"A": A, "B": B} }
 and reuses the existing joint eval utilities for injection + PPL.
 
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=0 \
 python evaluate_0.py \
   --prebake_root ./output/output_step0_prebake \
   --model_name meta-llama/Llama-3.2-3B \
-  --bits 4 \
+  --bits 2 \
   --device cuda:0 \
   --compare_wdq_only
 
