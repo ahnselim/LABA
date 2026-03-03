@@ -100,30 +100,6 @@ def pick_dtype(dtype_str: str):
     }[dtype_str]
 
 
-def _to_gib_str(v: float) -> str:
-    fv = float(v)
-    if fv <= 0:
-        raise ValueError(f"Memory cap must be > 0 GiB, got {v}")
-    if float(fv).is_integer():
-        return f"{int(fv)}GiB"
-    return f"{fv:.2f}GiB"
-
-
-def build_max_memory_map(
-    gpu_mem_cap_gib: Optional[float], cpu_mem_cap_gib: Optional[float]
-) -> Optional[Dict[object, str]]:
-    if gpu_mem_cap_gib is None:
-        return None
-    if not torch.cuda.is_available():
-        return None
-    max_memory: Dict[object, str] = {
-        i: _to_gib_str(gpu_mem_cap_gib) for i in range(torch.cuda.device_count())
-    }
-    if cpu_mem_cap_gib is not None:
-        max_memory["cpu"] = _to_gib_str(cpu_mem_cap_gib)
-    return max_memory
-
-
 def yield_windows(
     input_ids: torch.Tensor,
     seq_len: int,
@@ -443,9 +419,6 @@ def main():
         choices=["auto", "fp32", "fp16", "bf16", "float32", "float16", "bfloat16"],
     )
     parser.add_argument("--device_map", type=str, default="auto")
-    parser.add_argument("--gpu_mem_cap_gib", type=float, default=None)
-    parser.add_argument("--cpu_mem_cap_gib", type=float, default=None)
-    parser.add_argument("--offload_folder", type=str, default=None)
 
     # 데이터 소스 (기본: DKYoon/SlimPajama-6B)
     parser.add_argument(
@@ -503,33 +476,13 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs = dict(
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
         revision=args.revision,
         torch_dtype=dtype if (dtype in (torch.float16, torch.bfloat16)) else None,
         device_map=args.device_map,
         trust_remote_code=args.trust_remote_code,
     )
-    if args.gpu_mem_cap_gib is not None:
-        if str(args.device_map).lower() != "auto":
-            print(
-                f"[Step1][warn] gpu_mem_cap_gib requires device_map=auto; current={args.device_map}. Ignoring cap."
-            )
-        else:
-            mm = build_max_memory_map(args.gpu_mem_cap_gib, args.cpu_mem_cap_gib)
-            if mm is not None:
-                offload_dir = (
-                    str(Path(args.offload_folder).resolve())
-                    if args.offload_folder
-                    else str((Path(args.output_dir) / "_hf_offload_step1_1").resolve())
-                )
-                Path(offload_dir).mkdir(parents=True, exist_ok=True)
-                model_kwargs["max_memory"] = mm
-                model_kwargs["offload_folder"] = offload_dir
-                model_kwargs["offload_state_dict"] = True
-                print(
-                    f"[Step1] Applying max_memory={mm} with offload_folder={offload_dir}"
-                )
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
     # 토큰 예산 계산
     if args.stride is None:
@@ -683,9 +636,6 @@ class Step11SensitivityConfig:
     grad_scale: float = 1.0
     save_json: bool = False
     seed: int = 42
-    gpu_mem_cap_gib: Optional[float] = None
-    cpu_mem_cap_gib: Optional[float] = None
-    offload_folder: Optional[str] = None
     python_exe: str = sys.executable
     source_script: str = str(Path(__file__).resolve())
 
@@ -733,12 +683,6 @@ def build_command(cfg: Step11SensitivityConfig) -> List[str]:
         cmd.append("--include_lm_head")
     if cfg.save_json:
         cmd.append("--save_json")
-    if cfg.gpu_mem_cap_gib is not None:
-        cmd += ["--gpu_mem_cap_gib", str(float(cfg.gpu_mem_cap_gib))]
-    if cfg.cpu_mem_cap_gib is not None:
-        cmd += ["--cpu_mem_cap_gib", str(float(cfg.cpu_mem_cap_gib))]
-    if cfg.offload_folder is not None:
-        cmd += ["--offload_folder", str(cfg.offload_folder)]
     return cmd
 
 

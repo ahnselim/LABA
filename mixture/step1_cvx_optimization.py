@@ -12,18 +12,14 @@ Outputs:
   - out_root/step1_3/*
   - out_root/meta.json
   
-CUDA_VISIBLE_DEVICES=3 nohup \
+CUDA_VISIBLE_DEVICES=2 nohup \
 python step1_cvx_optimization.py \
-  --model_id meta-llama/Llama-3.2-3B \
-  --step0_out_root ./output/output_step0_prebake \
-  --out_root ./output/output_step1_cvx \
+  --model_id meta-llama/Llama-3.1-8B \
+  --step0_out_root ./output3_8b/output3_8b/output_step0_prebake \
+  --out_root ./output3_8b/output3_8b/output_step1_cvx \
   --alpha_reuse_calib \
   --bitopt_mode budget \
   --avg_bits 2.5 \
-  --gpu_mem_cap_gib 28 \
-  --cpu_mem_cap_gib 200 \
-  --sens_device_map auto \
-  --alpha_device_map auto \
   --trust_remote_code > ./logs/step1.log 2>&1 &
 
 """
@@ -66,23 +62,6 @@ def main() -> None:
     ap.add_argument("--trust_remote_code", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--python_exe", default=sys.executable)
-    ap.add_argument(
-        "--gpu_mem_cap_gib",
-        type=float,
-        default=None,
-        help="Per-GPU memory cap (GiB) for HF auto device_map + CPU offload.",
-    )
-    ap.add_argument(
-        "--cpu_mem_cap_gib",
-        type=float,
-        default=None,
-        help="Optional CPU memory cap (GiB) used with max_memory.",
-    )
-    ap.add_argument(
-        "--offload_root",
-        default=None,
-        help="Root folder for HF offload files (default: out_root/_hf_offload).",
-    )
 
     # Shared dataset defaults (step1_1 + step1_2)
     ap.add_argument("--dataset", default="DKYoon/SlimPajama-6B")
@@ -155,13 +134,6 @@ def main() -> None:
         if args.alpha_calib_cache_dir is not None
         else str((out_root / "calib_cache").resolve())
     )
-    offload_root = (
-        Path(args.offload_root).resolve()
-        if args.offload_root is not None
-        else (out_root / "_hf_offload").resolve()
-    )
-    step11_offload = str((offload_root / "step1_1").resolve())
-    step12_offload = str((offload_root / "step1_2").resolve())
 
     t0 = time.time()
     print("[step1-cvx] Running step1_1_sensitivity ...")
@@ -186,9 +158,6 @@ def main() -> None:
             grad_scale=args.sens_grad_scale,
             save_json=bool(args.sens_save_json),
             seed=args.seed,
-            gpu_mem_cap_gib=args.gpu_mem_cap_gib,
-            cpu_mem_cap_gib=args.cpu_mem_cap_gib,
-            offload_folder=step11_offload if args.gpu_mem_cap_gib is not None else None,
             python_exe=args.python_exe,
         )
     )
@@ -220,9 +189,6 @@ def main() -> None:
             keep_calib_on_device=bool(args.alpha_keep_calib_on_device),
             empty_cache_interval=args.alpha_empty_cache_interval,
             strict_prebake=bool(args.alpha_strict_prebake),
-            gpu_mem_cap_gib=args.gpu_mem_cap_gib,
-            cpu_mem_cap_gib=args.cpu_mem_cap_gib,
-            offload_folder=step12_offload if args.gpu_mem_cap_gib is not None else None,
         )
     )
     alpha_csv = Path(alpha_outs["alpha_csv"])
