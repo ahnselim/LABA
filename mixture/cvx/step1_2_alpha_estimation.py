@@ -96,6 +96,30 @@ def pick_dtype(dtype_str: str):
     }[dtype_str]
 
 
+def _to_gib_str(v: float) -> str:
+    fv = float(v)
+    if fv <= 0:
+        raise ValueError(f"Memory cap must be > 0 GiB, got {v}")
+    if float(fv).is_integer():
+        return f"{int(fv)}GiB"
+    return f"{fv:.2f}GiB"
+
+
+def build_max_memory_map(
+    gpu_mem_cap_gib: Optional[float], cpu_mem_cap_gib: Optional[float]
+) -> Optional[Dict[object, str]]:
+    if gpu_mem_cap_gib is None:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    max_memory: Dict[object, str] = {
+        i: _to_gib_str(gpu_mem_cap_gib) for i in range(torch.cuda.device_count())
+    }
+    if cpu_mem_cap_gib is not None:
+        max_memory["cpu"] = _to_gib_str(cpu_mem_cap_gib)
+    return max_memory
+
+
 def set_all_seeds(seed: int) -> None:
     import random
 
@@ -384,6 +408,9 @@ class Step12AlphaPrebakeConfig:
     keep_calib_on_device: bool = False
     empty_cache_interval: int = 0
     strict_prebake: bool = False
+    gpu_mem_cap_gib: Optional[float] = None
+    cpu_mem_cap_gib: Optional[float] = None
+    offload_folder: Optional[str] = None
 
 
 def _iter_bits(bits: Iterable[int]) -> List[int]:
@@ -477,13 +504,34 @@ def run(cfg: Step12AlphaPrebakeConfig) -> Dict[str, str]:
     dtype = pick_dtype(cfg.dtype)
 
     print(f"[Step1-2] Loading model: {cfg.model_id}")
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id,
+    model_kwargs = dict(
         revision=cfg.revision,
         torch_dtype=(dtype if dtype in (torch.float16, torch.bfloat16) else None),
         device_map=cfg.device_map,
         trust_remote_code=cfg.trust_remote_code,
     )
+    if cfg.gpu_mem_cap_gib is not None:
+        if str(cfg.device_map).lower() != "auto":
+            print(
+                f"[Step1-2][warn] gpu_mem_cap_gib requires device_map=auto; current={cfg.device_map}. Ignoring cap."
+            )
+        else:
+            mm = build_max_memory_map(cfg.gpu_mem_cap_gib, cfg.cpu_mem_cap_gib)
+            if mm is not None:
+                offload_dir = (
+                    str(Path(cfg.offload_folder).resolve())
+                    if cfg.offload_folder
+                    else str((Path(cfg.output_dir) / "_hf_offload_step1_2").resolve())
+                )
+                Path(offload_dir).mkdir(parents=True, exist_ok=True)
+                model_kwargs["max_memory"] = mm
+                model_kwargs["offload_folder"] = offload_dir
+                model_kwargs["offload_state_dict"] = True
+                print(
+                    f"[Step1-2] Applying max_memory={mm} with offload_folder={offload_dir}"
+                )
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_id, **model_kwargs)
     model.eval()
     tok = AutoTokenizer.from_pretrained(
         cfg.model_id, use_fast=True, trust_remote_code=cfg.trust_remote_code
@@ -717,6 +765,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> Step12AlphaPrebakeConfi
     ap.add_argument("--keep_calib_on_device", action="store_true")
     ap.add_argument("--empty_cache_interval", type=int, default=0)
     ap.add_argument("--strict_prebake", action="store_true")
+    ap.add_argument("--gpu_mem_cap_gib", type=float, default=None)
+    ap.add_argument("--cpu_mem_cap_gib", type=float, default=None)
+    ap.add_argument("--offload_folder", default=None)
     ns = ap.parse_args(argv)
     ns.bits = tuple(ns.bits)
     return Step12AlphaPrebakeConfig(**vars(ns))

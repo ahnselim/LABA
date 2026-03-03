@@ -13,7 +13,9 @@ Flow:
   3) Build:
        - wdq_star   : { "<module>.weight": Wq }
        - low_rank_ab: { "<module>.weight": {"A": A, "B": B} }
-  4) Reuse `joint.step4_eval` injection + WikiText-2 PPL evaluation (same as `evaluate_0.py`).
+  4) Evaluate WikiText-2 PPL with the same protocol used in step2 MC:
+       - tokenizer(..., add_special_tokens=False)
+       - chunked NLL accumulation via `module.montecarlo.run_live_ppl_eval`.
 
 Examples:
 CUDA_VISIBLE_DEVICES=3 \
@@ -39,21 +41,23 @@ import gc
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+from module.montecarlo import run_live_ppl_eval  # noqa: E402
 from joint.step4_eval import (  # noqa: E402
     AddLowRankCorrection,
     AddLowRankCorrectionFP32,
     apply_wdq_star,
-    evaluate_ppl_wikitext2,
     patch_layerwise_ab_from_step2p5,
 )
 
@@ -400,6 +404,32 @@ def _load_model_and_tokenizer(
     return model, tok
 
 
+def _build_eval_input_ids_step2_protocol(tokenizer, max_tokens: int) -> torch.Tensor:
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    text = "\n\n".join(ds["text"])
+    input_ids = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids
+    if max_tokens and max_tokens > 0 and input_ids.size(1) > int(max_tokens):
+        input_ids = input_ids[:, : int(max_tokens)].contiguous()
+    return input_ids
+
+
+@torch.no_grad()
+def _evaluate_ppl_step2_protocol(
+    model: torch.nn.Module,
+    eval_input_ids: torch.Tensor,
+    device: torch.device,
+    label: str,
+    seq_len: int,
+) -> Tuple[float, float]:
+    print(f"\n--- Evaluating PPL: {label} ---")
+    print(f"[PPL] tokenized seq_len={int(eval_input_ids.size(1))} (stride={int(seq_len)})")
+    start = time.time()
+    ppl = run_live_ppl_eval(model, eval_input_ids.to(device), seq_len=int(seq_len))
+    elapsed = time.time() - start
+    print(f"✅ PPL({label}) = {ppl:.4f} | time={elapsed:.2f}s")
+    return float(ppl), float(elapsed)
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -445,6 +475,7 @@ def main() -> None:
 
     model = None
     tok = None
+    eval_input_ids = None
     result = {
         "bit_assign_csv": str(bit_assign_csv),
         "prebake_root": str(prebake_root),
@@ -463,6 +494,7 @@ def main() -> None:
             torch_dtype=model_dtype,
             trust_remote_code=bool(args.trust_remote_code),
         )
+        eval_input_ids = _build_eval_input_ids_step2_protocol(tok, int(args.ppl_max_tokens))
 
         apply_wdq_star(model, wdq_star)
         model = patch_layerwise_ab_from_step2p5(
@@ -478,25 +510,23 @@ def main() -> None:
         if args.compare_wdq_only:
             n_wrapped = _set_ab_alpha(model, 0.0)
             print(f"[step1] Wdq-only eval (wrapped_modules={n_wrapped}, alpha=0.0)")
-            ppl_wdq, t_wdq = evaluate_ppl_wikitext2(
+            ppl_wdq, t_wdq = _evaluate_ppl_step2_protocol(
                 model,
-                tok,
+                eval_input_ids,
                 device,
                 label="step1:Wdq-only",
-                stride=int(args.ppl_stride),
-                max_tokens=int(args.ppl_max_tokens),
+                seq_len=int(args.ppl_stride),
             )
             result["ppl"]["wdq_only"] = {"ppl": float(ppl_wdq), "time_sec": float(t_wdq)}
 
         n_wrapped = _set_ab_alpha(model, float(args.ab_alpha))
         print(f"[step1] Wdq+AB eval (wrapped_modules={n_wrapped}, alpha={args.ab_alpha})")
-        ppl_ab, t_ab = evaluate_ppl_wikitext2(
+        ppl_ab, t_ab = _evaluate_ppl_step2_protocol(
             model,
-            tok,
+            eval_input_ids,
             device,
             label="step1:Wdq+AB",
-            stride=int(args.ppl_stride),
-            max_tokens=int(args.ppl_max_tokens),
+            seq_len=int(args.ppl_stride),
         )
         result["ppl"]["wdq_ab"] = {"ppl": float(ppl_ab), "time_sec": float(t_ab)}
 
@@ -511,6 +541,8 @@ def main() -> None:
             del model
         if tok is not None:
             del tok
+        if eval_input_ids is not None:
+            del eval_input_ids
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
