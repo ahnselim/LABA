@@ -95,6 +95,7 @@ from module.montecarlo import (
     ensure_complete_assignment,
     generate_random_neighbor,
     get_initial_seed,
+    load_seed_from_csv,
     project_to_weighted_band,
     weighted_sum_bits,
 )
@@ -630,8 +631,27 @@ def main(args):
         if not beam:
             raise RuntimeError("warmup beam init 실패(beam empty)")
     else:
-        print("[Init] target_avg_bits 기준 convex seed로 초기 beam 구성", flush=True)
-        b_seed = get_initial_seed(C_prime_filtered, W_map, target_avg, args.bmin, args.bmax)
+        b_seed: Dict[str, int] = {}
+        init_assign_csv = (args.init_assign_csv or "").strip()
+        if init_assign_csv:
+            if not os.path.exists(init_assign_csv):
+                print(
+                    f"[Warn] init_assign_csv not found, fallback to convex seed: {init_assign_csv}",
+                    flush=True,
+                )
+            else:
+                print(f"[Init] init_assign_csv에서 seed 로드: {init_assign_csv}", flush=True)
+                b_seed = load_seed_from_csv(init_assign_csv)
+                if not b_seed:
+                    print(
+                        f"[Warn] init_assign_csv has no valid rows, fallback to convex seed: {init_assign_csv}",
+                        flush=True,
+                    )
+
+        if not b_seed:
+            print("[Init] target_avg_bits 기준 convex seed로 초기 beam 구성", flush=True)
+            b_seed = get_initial_seed(C_prime_filtered, W_map, target_avg, args.bmin, args.bmax)
+
         b_seed = ensure_complete_assignment(b_seed, target_layers_list, args.bmin)
         b_seed = project_to_weighted_band(b_seed, W_map, C_prime_filtered, B_lo, B_hi, args.bmin, args.bmax)
 
@@ -948,6 +968,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--surrogate_static_info", type=str, required=True, help="static_info_v3.json (Input3)")
 
     # init
+    p.add_argument("--init_assign_csv", type=str, default="", help="Optional seed CSV (layer_name,R_int)")
     p.add_argument("--init_from_warmup_beam", action="store_true", help="warmup_ckpt의 beam으로 초기화")
     p.add_argument("--resume", action="store_true")
 
