@@ -243,6 +243,7 @@ def main():
 
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--device_map", type=str, default="auto")
+    ap.add_argument("--num_gpus", type=int, default=2, help="device_map=auto일 때 사용할 최대 GPU 개수")
     ap.add_argument("--trust_remote_code", action="store_true")
 
     ap.add_argument("--cov_mode", type=str, default="oas", choices=["var", "oas", "second_moment"])
@@ -276,12 +277,28 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"Loading model: {args.model_name} (device_map={args.device_map})")
+    model_kwargs = {
+        "torch_dtype": torch.float16,
+        "device_map": args.device_map,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": args.trust_remote_code,
+    }
+
+    if str(args.device_map).strip().lower() == "auto" and int(args.num_gpus) > 0 and torch.cuda.is_available():
+        visible = torch.cuda.device_count()
+        use_n = min(int(args.num_gpus), int(visible))
+        if use_n > 0:
+            max_memory = {}
+            for idx in range(use_n):
+                total_gib = int(torch.cuda.get_device_properties(idx).total_memory // (1024 ** 3))
+                max_memory[idx] = f"{max(1, total_gib - 1)}GiB"
+            max_memory["cpu"] = "512GiB"
+            model_kwargs["max_memory"] = max_memory
+            print(f"[Calib] auto device_map GPU limit: {use_n} (indices: {list(range(use_n))})")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        torch_dtype=torch.float16,
-        device_map=args.device_map,
-        low_cpu_mem_usage=True,
-        trust_remote_code=args.trust_remote_code,
+        **model_kwargs,
     )
     model.eval()
 
@@ -490,6 +507,7 @@ class Step02CalibConfig:
     batch_size: int = 1
     device: str = "cuda"
     device_map: str = "auto"
+    num_gpus: int = 2
     trust_remote_code: bool = False
     cov_mode: str = "oas"
     eps: float = 1e-8
@@ -527,6 +545,8 @@ def build_command(cfg: Step02CalibConfig) -> List[str]:
         str(cfg.device),
         "--device_map",
         str(cfg.device_map),
+        "--num_gpus",
+        str(int(cfg.num_gpus)),
         "--cov_mode",
         str(cfg.cov_mode),
         "--eps",

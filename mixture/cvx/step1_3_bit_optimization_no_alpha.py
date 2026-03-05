@@ -6,38 +6,32 @@ Step 3 — Bit Optimization (Continuous → Integer), layerwise (no grouping)
 
 모드:
  • target (기본): L_target를 맞추며 총비트 Σ w_j R_j 최소화
- • budget     : 평균비트(= --avg_bits) 제약을 맞추며 잔여손실 Σ C'·2^{-2R} 최소화
+ • budget     : 평균비트(= --avg_bits) 제약을 맞추며 잔여손실 Σ C·2^{-2R} 최소화
 
 입력:
  • --sens_csv (Step1 결과): columns=["layer_name","numel(w_j)","C_sum","C_mean_per_batch","C_per_param","batches"]
- • --alpha_csv (선택, Step2 결과): columns=["module","bit","alpha", ...]
-    - --alpha_bit로 사용할 α(b) 선택 (기본 3). 없으면 --alpha_default 사용(기본 1.0)
 
 사용 예:
   # (A) target 모드 (기존과 동일)
   python step3_bit_optimization.py \
     --sens_csv ./artifacts/bitmin/step1/layerwise_sensitivity.csv \
-    --alpha_csv ./artifacts/bitmin/step2/alpha_layerwise_rank64.csv \
-    --alpha_bit 3 \
     --C_col C_mean_per_batch \
     --target_ratio 0.40 \
     --bmin 1 --bmax 4 \
     --output_dir ./artifacts/bitmin/step3
 
   # (B) budget 모드 (평균 비트 = 2.25)
-  python cvx/step1_3_bit_optimization.py \
-    --sens_csv ./output/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
-    --alpha_csv ./output/output_step1_cvx/step1_2/alpha_layerwise_rankvar.csv \
-    --alpha_bit 1 \
+  python cvx/step1_3_bit_optimization_no_alpha.py \
+    --sens_csv ./output_7b/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
     --C_col C_mean_per_batch \
     --avg_bits 2.00 \
     --bmin 1 --bmax 4 \
-    --output_dir ./output/output_step1_cvx/step3_budget_2
+    --output_dir ./output_7b/output_step1_cvx/step3_budget_no_alpha
 """
 
 import os, csv, math, argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -75,39 +69,6 @@ def load_sensitivity_csv(
 
     return names, np.array(C_list, dtype=np.float64), np.array(w_list, dtype=np.float64)
 
-
-def load_alpha_csv(path: str, target_bit: int) -> Dict[str, float]:
-    """Step2 CSV 로드 → module별 α(b)
-    기대 열: 'module','bit','alpha'
-    반환: {module: alpha_float}
-    """
-    amap: Dict[str, float] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        for row in rdr:
-            try:
-                b = int(row.get("bit", "").strip())
-            except Exception:
-                continue
-            if b != target_bit:
-                continue
-
-            mod = row.get("module")
-            if not mod:
-                fn = row.get("full_name", "")
-                if fn.endswith(".weight"):
-                    mod = fn[:-7]
-            if not mod:
-                continue
-
-            try:
-                a = float(row["alpha"])
-            except Exception:
-                a = float(row.get("alpha", "1.0"))
-            amap[mod] = a
-    return amap
-
-
 # -------------------------
 # target 모드: λ-이분 (잔여 목표, 비용 최소)
 # -------------------------
@@ -115,8 +76,8 @@ def compute_residual_target(
     Cp: np.ndarray, w: np.ndarray, lam: float, bmin: float, bmax: float
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """target 모드에서
-    R(λ) = clamp( 0.5*log2(λ·C'/w), [bmin,bmax] )
-    L(λ) = Σ C'·2^{-2R}
+    R(λ) = clamp( 0.5*log2(λ·C/w), [bmin,bmax] )
+    L(λ) = Σ C·2^{-2R}
     """
     Cp_pos = np.maximum(Cp, 0.0)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -250,8 +211,8 @@ def compute_bits_budget(
     Cp: np.ndarray, w: np.ndarray, mu: float, bmin: float, bmax: float
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """budget 모드에서
-    R(μ) = clamp( 0.5*log2(C'/(μ·w)), [bmin,bmax] )
-    S(μ) = Σ w·R, L(μ) = Σ C'·2^{-2R}
+    R(μ) = clamp( 0.5*log2(C/(μ·w)), [bmin,bmax] )
+    S(μ) = Σ w·R, L(μ) = Σ C·2^{-2R}
     """
     Cp_pos = np.maximum(Cp, 0.0)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -383,13 +344,13 @@ def greedy_integer_refine_budget(
 def main():
     ap = argparse.ArgumentParser("Step 3 — Bit Optimization (Continuous → Integer)")
     ap.add_argument("--sens_csv", required=True, help="Step1 CSV path")
-    ap.add_argument("--alpha_csv", default=None, help="(Optional) Step2 CSV path")
+    ap.add_argument("--alpha_csv", default=None, help=argparse.SUPPRESS)
     ap.add_argument(
         "--alpha_bit",
         type=int,
         default=3,
         choices=[1, 2, 3, 4],
-        help="alpha(b)에서 사용할 bit",
+        help=argparse.SUPPRESS,
     )
     ap.add_argument(
         "--C_col",
@@ -416,7 +377,7 @@ def main():
         "--target_ratio",
         type=float,
         default=0.50,
-        help="L_target = target_ratio * Σ C'·2^{-2·bmin} (abs가 없을 때 사용)",
+        help="L_target = target_ratio * Σ C·2^{-2·bmin} (abs가 없을 때 사용)",
     )
 
     # budget 모드 옵션
@@ -430,7 +391,7 @@ def main():
         "--alpha_default",
         type=float,
         default=1.0,
-        help="alpha CSV에 항목 없을 때 기본 α",
+        help=argparse.SUPPRESS,
     )
     ap.add_argument("--bmin", type=int, default=1)
     ap.add_argument("--bmax", type=int, default=4)
@@ -452,17 +413,8 @@ def main():
     )
     n = len(names)
 
-    if args.alpha_csv:
-        amap = load_alpha_csv(args.alpha_csv, target_bit=args.alpha_bit)
-        alpha = np.array(
-            [float(amap.get(name, args.alpha_default)) for name in names],
-            dtype=np.float64,
-        )
-    else:
-        alpha = np.full(n, args.alpha_default, dtype=np.float64)
-
-    # 2) C' 구성
-    Cp = alpha * C
+    # 2) C 구성 (no-alpha): 잔여손실 모델 L = Σ C·2^{-2R}
+    Cp = C.copy()
     Cp[Cp < 0.0] = 0.0  # 안전 클램프
     bmin, bmax = int(args.bmin), int(args.bmax)
 
@@ -539,12 +491,10 @@ def main():
                 "layer_name",
                 "w_j",
                 "C_j",
-                "alpha_j",
-                "Cprime_j",
                 "R_cont",
                 "R_clamped",
                 "R_int",
-                "term_residual_int=C'·2^{-2R_int}",
+                "term_residual_int=C·2^{-2R_int}",
             ]
         )
         for i in range(n):
@@ -554,8 +504,6 @@ def main():
                     names[i],
                     f"{w[i]:.0f}",
                     f"{C[i]:.6e}",
-                    f"{alpha[i]:.6e}",
-                    f"{Cp[i]:.6e}",
                     f"{float(R_cont[i]):.6f}",
                     f"{float(R_clamped[i]):.6f}",
                     int(b_int[i]),
@@ -658,6 +606,7 @@ def _invoke_local_main(argv: Sequence[str]) -> subprocess.CompletedProcess:
 class Step13BitOptConfig:
     sens_csv: str
     output_dir: str
+    # backward-compat fields (ignored in no-alpha optimization)
     alpha_csv: Optional[str] = None
     alpha_bit: int = 3
     C_col: str = "C_mean_per_batch"
@@ -681,16 +630,12 @@ def build_command(cfg: Step13BitOptConfig) -> List[str]:
         str(cfg.source_script),
         "--sens_csv",
         str(cfg.sens_csv),
-        "--alpha_bit",
-        str(int(cfg.alpha_bit)),
         "--C_col",
         str(cfg.C_col),
         "--w_col",
         str(cfg.w_col),
         "--target_ratio",
         str(float(cfg.target_ratio)),
-        "--alpha_default",
-        str(float(cfg.alpha_default)),
         "--bmin",
         str(int(cfg.bmin)),
         "--bmax",
@@ -702,8 +647,6 @@ def build_command(cfg: Step13BitOptConfig) -> List[str]:
         "--output_dir",
         str(cfg.output_dir),
     ]
-    if cfg.alpha_csv is not None:
-        cmd += ["--alpha_csv", str(cfg.alpha_csv)]
     if cfg.mode is not None:
         cmd += ["--mode", str(cfg.mode)]
     if cfg.target_residual is not None:

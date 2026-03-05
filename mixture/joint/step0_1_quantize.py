@@ -53,6 +53,16 @@ def module_name_from_weight(full_weight_name: str) -> str:
     return full_weight_name[: -len(".weight")]
 
 
+def _snapshot_state_to_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    state: Dict[str, torch.Tensor] = {}
+    for k, v in model.state_dict().items():
+        # With accelerate offload, meta tensors may appear in state_dict.
+        if getattr(v, "is_meta", False):
+            raise NotImplementedError(f"meta tensor in state_dict: {k}")
+        state[k] = v.detach().to("cpu")
+    return state
+
+
 # -------------------------------
 # Bit assignment loader (기존과 동일)
 # -------------------------------
@@ -305,6 +315,7 @@ def main():
     ap.add_argument("--dtype", default="auto",
                     choices=["auto", "fp32", "fp16", "bf16", "float32", "float16", "bfloat16"])
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device_map", default="auto", help='Model load placement: e.g. "auto" or "none"')
 
     ap.add_argument("--bit_assign_csv", default=None)
     ap.add_argument("--bits", type=int, default=4, choices=[1,2,3,4],
@@ -339,14 +350,23 @@ def main():
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
-    print(f"[Step1-LLoyd] Loading model: {args.model_id} (load_dtype={load_dtype}, device={device})")
+    dm_raw = str(args.device_map).strip().lower()
+    resolved_device_map = None if dm_raw in {"", "none", "null"} else args.device_map
+
+    print(
+        f"[Step1-LLoyd] Loading model: {args.model_id} "
+        f"(load_dtype={load_dtype}, device={device}, device_map={resolved_device_map})"
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         revision=args.revision,
         torch_dtype=(load_dtype if load_dtype in (torch.float16, torch.bfloat16) else None),
         trust_remote_code=args.trust_remote_code,
-        device_map=None,
-    ).to(device)
+        device_map=resolved_device_map,
+        low_cpu_mem_usage=True,
+    )
+    if resolved_device_map is None:
+        model = model.to(device)
 
     if args.bit_assign_csv:
         sel_bits = load_selected_bits(args.bit_assign_csv)
@@ -355,8 +375,29 @@ def main():
         sel_bits = None
 
     # CPU state dict로 옮겨서 GPU 메모리 절약
-    state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
-    del model
+    try:
+        state = _snapshot_state_to_cpu(model)
+        del model
+    except NotImplementedError:
+        if resolved_device_map is None:
+            raise
+        print("[Step1-LLoyd] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            revision=args.revision,
+            torch_dtype=(load_dtype if load_dtype in (torch.float16, torch.bfloat16) else None),
+            trust_remote_code=args.trust_remote_code,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+        state = _snapshot_state_to_cpu(model)
+        del model
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -488,6 +529,7 @@ class Step01QuantizeConfig:
     trust_remote_code: bool = False
     dtype: str = "auto"
     device: str = "cuda"
+    device_map: str = "auto"
     bit_assign_csv: Optional[str] = None
     clip_percentile: float = 0.0
     lloyd_iter: int = 12
@@ -524,6 +566,8 @@ def build_command(cfg: Step01QuantizeConfig) -> List[str]:
         str(cfg.dtype),
         "--device",
         str(cfg.device),
+        "--device_map",
+        str(cfg.device_map),
         "--clip_percentile",
         str(float(cfg.clip_percentile)),
         "--lloyd_iter",

@@ -119,7 +119,7 @@ def dequant_from_codebook_codes(
     xq = torch.gather(cb, dim=1, index=idx)
     xq = xq.reshape(o, g, s)
     wq_pad = xq.reshape(o, g * s)
-    return wq_pad[:, :orig_i].contiguous()
+    return wq_pad[:, :orig_i]
 
 
 @torch.no_grad()
@@ -204,6 +204,16 @@ def append_jsonl(path: Path, rec: dict) -> None:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _snapshot_state_to_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    state: Dict[str, torch.Tensor] = {}
+    for k, v in model.state_dict().items():
+        # With accelerate offload, meta tensors may appear in state_dict.
+        if getattr(v, "is_meta", False):
+            raise NotImplementedError(f"meta tensor in state_dict: {k}")
+        state[k] = v.detach().to("cpu")
+    return state
+
+
 def flush_outputs(
     out_dir: Path,
     delta_out: Dict[str, torch.Tensor],
@@ -258,16 +268,41 @@ def load_context(args: argparse.Namespace) -> dict:
     else:
         load_dtype = torch.float32
 
-    print(f"[V2] loading original model: {args.model_id}")
+    dm_raw = str(args.model_device_map).strip().lower()
+    resolved_model_device_map = None if dm_raw in {"", "none", "null"} else args.model_device_map
+
+    print(f"[V2] loading original model: {args.model_id} (device_map={resolved_model_device_map})")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         revision=args.revision,
         torch_dtype=(load_dtype if load_dtype in (torch.float16, torch.bfloat16) else None),
         trust_remote_code=args.trust_remote_code,
-        device_map=None,
+        device_map=resolved_model_device_map,
+        low_cpu_mem_usage=True,
     )
-    state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
-    del model
+    try:
+        state = _snapshot_state_to_cpu(model)
+        del model
+    except NotImplementedError:
+        if resolved_model_device_map is None:
+            raise
+        print("[V2] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            revision=args.revision,
+            torch_dtype=(load_dtype if load_dtype in (torch.float16, torch.bfloat16) else None),
+            trust_remote_code=args.trust_remote_code,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+        state = _snapshot_state_to_cpu(model)
+        del model
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -424,19 +459,30 @@ def optimize_over_keys(
             c = c_cpu.to(device)
             codes = codes_cpu.to(device)
             s = s_cpu.to(device)
+            s_row = s.unsqueeze(0)
+            rw_buf = torch.empty_like(w)
 
             delta = torch.nn.Parameter(torch.zeros_like(c, dtype=torch.float32, device=device))
             u = torch.ones((o,), device=device, dtype=torch.float32)
             v = torch.ones((i,), device=device, dtype=torch.float32)
-            opt = torch.optim.Adam([delta], lr=float(params["lr_delta"]))
+            opt_kwargs = {"lr": float(params["lr_delta"])}
+            if device.type == "cuda":
+                opt_kwargs["fused"] = True
+            try:
+                opt = torch.optim.Adam([delta], **opt_kwargs)
+            except (TypeError, RuntimeError):
+                if "fused" in opt_kwargs:
+                    opt_kwargs.pop("fused", None)
+                    opt = torch.optim.Adam([delta], **opt_kwargs)
+                else:
+                    raise
 
             with torch.no_grad():
                 wq0 = dequant_from_codebook_codes(c + delta, codes, orig_i=i)
-                e0 = w - wq0
-                rw0 = e0 * s.unsqueeze(0)
-                a, b = rank_r_svd(rw0, r=int(args.rank_ab))
+                rw_buf.copy_(w).sub_(wq0).mul_(s_row)
+                a, b = rank_r_svd(rw_buf, r=int(args.rank_ab))
 
-            wq = e = rw = None
+            wq = None
             mse = float("inf")
             dnorm = float("inf")
             best_mse = float("inf")
@@ -456,15 +502,16 @@ def optimize_over_keys(
                     for pg in opt.param_groups:
                         pg["lr"] = lr_cur
 
-                    for _ in range(max(1, int(args.delta_steps))):
-                        opt.zero_grad(set_to_none=True)
-                        wq = dequant_from_codebook_codes(c + delta, codes, orig_i=i)
-                        e = w - wq
-                        rw = e * s.unsqueeze(0)
-
+                    with torch.no_grad():
                         m = a @ b
                         pred = (u.unsqueeze(1) * m) * v.unsqueeze(0)
-                        loss_rec = torch.mean((rw - pred) ** 2)
+
+                    for _ in range(max(1, int(args.delta_steps))):
+                        opt.zero_grad(set_to_none=True)
+                        rw_buf = rw_buf.detach()
+                        wq = dequant_from_codebook_codes(c + delta, codes, orig_i=i)
+                        rw_buf.copy_(w).sub_(wq).mul_(s_row)
+                        loss_rec = torch.mean((rw_buf - pred) ** 2)
                         loss_reg = float(params["lam_delta"]) * torch.mean(delta ** 2)
                         loss = loss_rec + loss_reg
                         loss.backward()
@@ -475,19 +522,18 @@ def optimize_over_keys(
 
                     with torch.no_grad():
                         wq = dequant_from_codebook_codes(c + delta, codes, orig_i=i)
-                        e = w - wq
-                        rw = e * s.unsqueeze(0)
+                        rw_buf.copy_(w).sub_(wq).mul_(s_row)
 
                         eps = float(args.eps)
                         u_sign = torch.where(u >= 0, torch.ones_like(u), -torch.ones_like(u))
                         v_sign = torch.where(v >= 0, torch.ones_like(v), -torch.ones_like(v))
                         u_inv = 1.0 / (u_sign * u.abs().clamp_min(eps))
                         v_inv = 1.0 / (v_sign * v.abs().clamp_min(eps))
-                        rbar = (u_inv.unsqueeze(1) * rw) * v_inv.unsqueeze(0)
+                        rbar = (u_inv.unsqueeze(1) * rw_buf) * v_inv.unsqueeze(0)
                         a, b = rank_r_svd(rbar, r=int(args.rank_ab))
 
                         u, v = update_uv_closed_form(
-                            rw=rw,
+                            rw=rw_buf,
                             a=a,
                             b=b,
                             u=u,
@@ -499,7 +545,7 @@ def optimize_over_keys(
 
                         m = a @ b
                         pred = (u.unsqueeze(1) * m) * v.unsqueeze(0)
-                        mse = torch.mean((rw - pred) ** 2).item()
+                        mse = torch.mean((rw_buf - pred) ** 2).item()
                         dnorm = torch.mean(delta.detach() ** 2).item()
 
                         if mse < best_mse:
@@ -557,10 +603,10 @@ def optimize_over_keys(
                 if save_artifacts:
                     with torch.no_grad():
                         wq_final = dequant_from_codebook_codes(c + delta, codes, orig_i=i)
-                        rw_final = (w - wq_final) * s.unsqueeze(0)
+                        rw_buf.copy_(w).sub_(wq_final).mul_(s_row)
                         m_final = a @ b
                         pred_final = (u.unsqueeze(1) * m_final) * v.unsqueeze(0)
-                        mse_final = torch.mean((rw_final - pred_final) ** 2).item()
+                        mse_final = torch.mean((rw_buf - pred_final) ** 2).item()
 
                         if best_delta is None:
                             best_mse = float(mse_final)
@@ -616,16 +662,13 @@ def optimize_over_keys(
                             wdq_best_out=wdq_best_out,
                         )
             finally:
-                del w, c, codes, s, delta, a, b, u, v
+                del w, c, codes, s, s_row, rw_buf, delta, a, b, u, v
                 if wq is not None:
                     del wq
-                if e is not None:
-                    del e
-                if rw is not None:
-                    del rw
-                if torch.cuda.is_available():
+                if torch.cuda.is_available() and ((li + 1) % 8 == 0 or li == len(keys) - 1):
                     torch.cuda.empty_cache()
-                gc.collect()
+                if (li + 1) % 8 == 0 or li == len(keys) - 1:
+                    gc.collect()
 
         if save_artifacts:
             flush_outputs(
@@ -703,6 +746,7 @@ def main() -> None:
 
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--eval_device", default="cuda:0")
+    ap.add_argument("--model_device_map", default="auto", help='Model load placement: e.g. "auto" or "none"')
     ap.add_argument("--dtype_w", default="fp16", choices=["fp16", "bf16", "fp32"])
 
     ap.add_argument("--rank_ab", type=int, default=64)
@@ -985,6 +1029,7 @@ class Step03BOConfig:
     trust_remote_code: bool = False
     device: str = "cuda"
     eval_device: str = "cuda:0"
+    model_device_map: str = "auto"
     dtype_w: str = "fp16"
     outer_loops: int = 40
     delta_steps: int = 8
@@ -1028,6 +1073,8 @@ def build_command(cfg: Step03BOConfig) -> List[str]:
         str(cfg.device),
         "--eval_device",
         str(cfg.eval_device),
+        "--model_device_map",
+        str(cfg.model_device_map),
         "--dtype_w",
         str(cfg.dtype_w),
         "--rank_ab",

@@ -9,13 +9,13 @@ This wraps the copied mixer scripts under `LABA/mixture/mc` and wires
 step2_1 artifacts into step2_2 automatically.
 
 기본 사용 (step2_1 + step2_2 연속 실행):
-CUDA_VISIBLE_DEVICES=3 nohup python step2_montecarlo.py \
-  --model_id meta-llama/Llama-3.2-3B \
-  --sens_csv ./output/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
-  --alpha_csv ./output/output_step1_cvx/step1_2/alpha_layerwise_prebake.csv \
-  --prebake_root ./output/output_step0_prebake \
+CUDA_VISIBLE_DEVICES=2 nohup python step2_montecarlo.py \
+  --model_id huggyllama/llama-7b \
+  --sens_csv ./output_7b/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
+  --alpha_csv ./output_7b/output_step1_cvx/step1_2/alpha_layerwise_prebake.csv \
+  --prebake_root ./output_7b/output_step0_prebake \
   --target_avg_bits 2.5 \
-  --out_root ./output/output_step2_mc \
+  --out_root ./output_7b/output_step2_mc \
   --gpu_id 0 \
   --use_round_band \
   --warmup_bits_lo 2.5 --warmup_bits_hi 3.0 \

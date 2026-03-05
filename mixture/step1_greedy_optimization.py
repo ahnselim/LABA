@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Integrated CVX pipeline for mixture outputs:
-  step1_1_sensitivity -> step1_2_alpha_estimation(prebake-aware) -> step1_3_bit_optimization
+Integrated greedy pipeline for mixture outputs:
+  step1_1_sensitivity -> step1_2_alpha_estimation(prebake-aware) -> step1_3c_opt
 
 Inputs:
   - step0_optimization output root (`bit1..bit4/`, `meta.json`)
@@ -22,10 +22,10 @@ export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
 CUDA_VISIBLE_DEVICES=2,3 nohup \
-python step1_cvx_optimization.py \
+python step1_greedy_optimization.py \
   --model_id huggyllama/llama-7b \
   --step0_out_root ./output_7b/output_step0_prebake \
-  --out_root ./output_7b/output_step1_cvx \
+  --out_root ./output_7b/output_step1_greedy \
   --alpha_reuse_calib \
   --bitopt_mode budget \
   --avg_bits 2.5 \
@@ -51,11 +51,11 @@ if str(_THIS_DIR) not in sys.path:
 if __package__:
     from .cvx.step1_1_sensitivity import Step11SensitivityConfig, run as run_step11
     from .cvx.step1_2_alpha_estimation import Step12AlphaPrebakeConfig, run as run_step12
-    from .cvx.step1_3_bit_optimization import Step13BitOptConfig, run as run_step13
+    from .cvx.step1_3c_opt import Step13COptConfig, run as run_step13
 else:
     from cvx.step1_1_sensitivity import Step11SensitivityConfig, run as run_step11
     from cvx.step1_2_alpha_estimation import Step12AlphaPrebakeConfig, run as run_step12
-    from cvx.step1_3_bit_optimization import Step13BitOptConfig, run as run_step13
+    from cvx.step1_3c_opt import Step13COptConfig, run as run_step13
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -65,7 +65,7 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Integrated mixture CVX step1 pipeline (1_1 -> 1_2 -> 1_3)")
+    ap = argparse.ArgumentParser("Integrated mixture greedy step1 pipeline (1_1 -> 1_2 -> 1_3)")
     ap.add_argument("--model_id", required=True)
     ap.add_argument("--step0_out_root", required=True, help="Output root from mixture/step0_optimization.py")
     ap.add_argument("--out_root", required=True)
@@ -109,19 +109,37 @@ def main() -> None:
     ap.add_argument("--alpha_empty_cache_interval", type=int, default=0)
     ap.add_argument("--alpha_strict_prebake", action="store_true")
 
-    # Step1-3 bit optimization args
+    # Step1-3c greedy/discrete optimization args
     ap.add_argument("--bitopt_mode", choices=["target", "budget"], default=None)
-    ap.add_argument("--alpha_bit", type=int, default=3, choices=[1, 2, 3, 4])
     ap.add_argument("--C_col", default="C_mean_per_batch")
     ap.add_argument("--w_col", default="numel(w_j)")
     ap.add_argument("--target_ratio", type=float, default=0.50)
     ap.add_argument("--target_residual", type=float, default=None)
     ap.add_argument("--avg_bits", type=float, default=None)
-    ap.add_argument("--alpha_default", type=float, default=1.0)
+    ap.add_argument("--total_bits", type=float, default=None)
+    ap.add_argument("--bits", default=None, help="Comma-separated bit set (e.g. 1,2,3,4). If omitted, uses bmin..bmax.")
     ap.add_argument("--bmin", type=int, default=1)
     ap.add_argument("--bmax", type=int, default=4)
-    ap.add_argument("--max_iter", type=int, default=64)
-    ap.add_argument("--tol_rel", type=float, default=1e-6)
+    ap.add_argument("--init_bit", type=int, default=2)
+    ap.add_argument(
+        "--normalize_lres_by_refbit",
+        dest="normalize_lres_by_refbit",
+        action="store_true",
+        default=True,
+    )
+    ap.add_argument(
+        "--no-normalize_lres_by_refbit",
+        dest="normalize_lres_by_refbit",
+        action="store_false",
+    )
+    ap.add_argument("--norm_ref_bit", type=int, default=4)
+    ap.add_argument("--norm_eps", type=float, default=1e-12)
+    ap.add_argument("--proxy_shape", choices=["absolute", "marginal_gain"], default="marginal_gain")
+    ap.add_argument("--marginal_gain_power", type=float, default=1.85)
+    ap.add_argument("--cj_transform", choices=["none", "sqrt", "log1p_mean", "power"], default="power")
+    ap.add_argument("--cj_power", type=float, default=0.7)
+    ap.add_argument("--cj_clip_min", type=float, default=1e-12)
+    ap.add_argument("--cj_floor_ratio", type=float, default=0.0)
 
     args = ap.parse_args()
 
@@ -147,7 +165,7 @@ def main() -> None:
     )
 
     t0 = time.time()
-    print("[step1-cvx] Running step1_1_sensitivity ...")
+    print("[step1-greedy] Running step1_1_sensitivity ...")
     run_step11(
         Step11SensitivityConfig(
             model_id=args.model_id,
@@ -176,7 +194,7 @@ def main() -> None:
     if not sens_csv.exists():
         raise RuntimeError(f"step1_1 output missing: {sens_csv}")
 
-    print("[step1-cvx] Running step1_2_alpha_estimation (prebake-aware) ...")
+    print("[step1-greedy] Running step1_2_alpha_estimation (prebake-aware) ...")
     alpha_outs = run_step12(
         Step12AlphaPrebakeConfig(
             model_id=args.model_id,
@@ -204,23 +222,36 @@ def main() -> None:
     )
     alpha_csv = Path(alpha_outs["alpha_csv"])
 
-    print("[step1-cvx] Running step1_3_bit_optimization ...")
+    if args.bits is None:
+        if args.bmin > args.bmax:
+            raise ValueError(f"bmin must be <= bmax, got bmin={args.bmin}, bmax={args.bmax}")
+        bits = ",".join(str(b) for b in range(int(args.bmin), int(args.bmax) + 1))
+    else:
+        bits = str(args.bits)
+
+    print("[step1-greedy] Running step1_3c_opt ...")
     run_step13(
-        Step13BitOptConfig(
+        Step13COptConfig(
             sens_csv=str(sens_csv),
             alpha_csv=str(alpha_csv),
-            alpha_bit=args.alpha_bit,
             C_col=args.C_col,
             w_col=args.w_col,
+            bits=bits,
             mode=args.bitopt_mode,
+            total_bits=args.total_bits,
             target_residual=args.target_residual,
             target_ratio=args.target_ratio,
             avg_bits=args.avg_bits,
-            alpha_default=args.alpha_default,
-            bmin=args.bmin,
-            bmax=args.bmax,
-            max_iter=args.max_iter,
-            tol_rel=args.tol_rel,
+            init_bit=args.init_bit,
+            normalize_lres_by_refbit=bool(args.normalize_lres_by_refbit),
+            norm_ref_bit=args.norm_ref_bit,
+            norm_eps=args.norm_eps,
+            proxy_shape=args.proxy_shape,
+            marginal_gain_power=args.marginal_gain_power,
+            cj_transform=args.cj_transform,
+            cj_power=args.cj_power,
+            cj_clip_min=args.cj_clip_min,
+            cj_floor_ratio=args.cj_floor_ratio,
             output_dir=str(d13),
             python_exe=args.python_exe,
         )
@@ -252,7 +283,7 @@ def main() -> None:
     }
     _write_json(out_root / "meta.json", meta)
 
-    print("[step1-cvx] COMPLETED")
+    print("[step1-greedy] COMPLETED")
     print(f"  out_root      : {out_root}")
     print(f"  sens_csv      : {sens_csv}")
     print(f"  alpha_csv     : {alpha_csv}")

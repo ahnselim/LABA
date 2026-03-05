@@ -15,16 +15,28 @@ Output (step4_prebake-compatible layout):
     best_raw/bit{b}/wdq_star_best.pt
     best_raw/bit{b}/lowrank_uv_ab_best.pt
     summaries/*.json
-  
-CUDA_VISIBLE_DEVICES=3 nohup \
+
+export HF_HOME=/ssd/ssd4/asl/.cache
+export HF_HUB_CACHE=/ssd/ssd4/asl/.cache/hub
+export HF_DATASETS_CACHE=/ssd/ssd4/asl/.cache/datasets
+unset TRANSFORMERS_CACHE
+
+# 캐시가 이미 다 있으면 오프라인 유지
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+CUDA_VISIBLE_DEVICES=1,0 nohup \
 python step0_optimization.py \
-  --model_id Qwen/Qwen3-8B \
-  --out_root ./output_q3_8b/output_step0_prebake \
+  --model_id meta-llama/Llama-2-13b-hf \
+  --out_root ./output_13b/output_step0_prebake \
   --group_size_1 128 --group_size_2 128 --group_size_3 128 --group_size_4 128 \
   --rank_ab_1 64 --rank_ab_2 64 --rank_ab_3 64 --rank_ab_4 64 \
   --stage1_max_blocks 8 --stage1_n_trials 20 \
   --nsamples 64 --seq_len 2048 \
-  --trust_remote_code > ./logs/step0_q3_8b.log 2>&1 &
+  --device cuda:0 \
+  --device_map auto \
+  --step2_num_gpus 2 \
+  --step3_model_device_map none \
+  --trust_remote_code > ./logs/step0_13b.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=3 nohup \
 python step0_optimization.py \
@@ -108,6 +120,63 @@ def _cleanup_path(path: Path) -> None:
         shutil.rmtree(path)
     else:
         path.unlink()
+
+
+def _step1_outputs_ready(step1_out_dir: Path) -> bool:
+    required = (
+        step1_out_dir / "codebook.pt",
+        step1_out_dir / "qcodes.pt",
+        step1_out_dir / "meta.pt",
+    )
+    return all(p.exists() for p in required)
+
+
+def _step2_output_ready(step2_out_path: Path) -> bool:
+    return step2_out_path.exists()
+
+
+def _find_existing_step3_outputs(step3_out_root: Path, study_name: str) -> Optional[Dict[str, Path]]:
+    if not step3_out_root.exists():
+        return None
+    cands = [
+        p
+        for p in step3_out_root.iterdir()
+        if p.is_dir() and p.name.startswith(f"{study_name}_") and (p / "summary.json").exists()
+    ]
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for run_dir in cands:
+        stage2 = run_dir / "stage2_full"
+        wdq = stage2 / "wdq_star_best.pt"
+        uvab = stage2 / "lowrank_uv_ab_best.pt"
+        if wdq.exists() and uvab.exists():
+            return {
+                "run_dir": run_dir,
+                "stage1_dir": run_dir / "stage1_bo",
+                "stage2_dir": stage2,
+                "summary": run_dir / "summary.json",
+                "summary_stage2": stage2 / "summary_stage2.json",
+                "wdq_star_best": wdq,
+                "lowrank_uv_ab_best": uvab,
+            }
+    return None
+
+
+def _resolve_calib_s_for_export(step2_out_path: Path, step3_outs: Dict[str, Path]) -> Path:
+    if step2_out_path.exists():
+        return step2_out_path
+
+    summary_stage2 = Path(step3_outs.get("summary_stage2", ""))
+    if summary_stage2.exists():
+        try:
+            payload = json.loads(summary_stage2.read_text(encoding="utf-8"))
+            calib_s_path = Path(str(payload.get("calib_s_path", "")))
+            if calib_s_path.exists():
+                return calib_s_path
+        except Exception:
+            pass
+    raise FileNotFoundError(
+        f"calib_s not found for export (expected {step2_out_path} or calib_s_path from {summary_stage2})"
+    )
 
 
 def _ensure_inv_s(entry: dict) -> torch.Tensor:
@@ -243,7 +312,18 @@ def main() -> None:
     ap.add_argument("--seq_len", type=int, default=2048)
     ap.add_argument("--nsamples", type=int, default=64)
     ap.add_argument("--batch_size", type=int, default=1)
-    ap.add_argument("--device_map", default="auto")
+    ap.add_argument(
+        "--step2_num_gpus",
+        type=int,
+        default=2,
+        help="Step2 calib에서 device_map=auto일 때 사용할 최대 GPU 개수",
+    )
+    ap.add_argument("--device_map", default="auto", help='Model load placement for step1/2: e.g. "auto" or "none"')
+    ap.add_argument(
+        "--step3_model_device_map",
+        default=None,
+        help='Model load placement for step3 only. If omitted, falls back to --device_map.',
+    )
     ap.add_argument("--cov_mode", default="oas", choices=["var", "oas", "second_moment"])
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--seed", type=int, default=42)
@@ -272,6 +352,19 @@ def main() -> None:
 
     # Cleanup behavior
     ap.add_argument("--keep_temps", action="store_true", help="Keep temporary step1/step2/step3 directories")
+    ap.add_argument(
+        "--skip_existing_steps",
+        dest="skip_existing_steps",
+        action="store_true",
+        help="Skip step1/2/3 when their outputs already exist.",
+    )
+    ap.add_argument(
+        "--no_skip_existing_steps",
+        dest="skip_existing_steps",
+        action="store_false",
+        help="Always re-run step1/2/3 even if outputs already exist.",
+    )
+    ap.set_defaults(skip_existing_steps=True)
 
     args = ap.parse_args()
 
@@ -302,85 +395,111 @@ def main() -> None:
 
         print(f"\n[step0] bit={bit} start | group_size={group_size} | rank_ab={rank_ab}")
 
-        run_step01(
-            Step01QuantizeConfig(
-                model_id=args.model_id,
-                revision=args.revision,
-                trust_remote_code=bool(args.trust_remote_code),
-                dtype=args.dtype,
-                device=args.device,
-                bits=int(bit),
-                group_size=group_size,
-                clip_percentile=args.clip_percentile,
-                lloyd_iter=args.lloyd_iter,
-                chunk_groups=args.chunk_groups,
-                layer_regex=args.layer_regex,
-                out_dir=str(step1_out_dir),
-                python_exe=args.python_exe,
+        step1_skipped = False
+        if args.skip_existing_steps and _step1_outputs_ready(step1_out_dir):
+            step1_skipped = True
+            print(f"[step0] bit={bit} step1 skip (found: {step1_out_dir})")
+        else:
+            run_step01(
+                Step01QuantizeConfig(
+                    model_id=args.model_id,
+                    revision=args.revision,
+                    trust_remote_code=bool(args.trust_remote_code),
+                    dtype=args.dtype,
+                    device=args.device,
+                    device_map=args.device_map,
+                    bits=int(bit),
+                    group_size=group_size,
+                    clip_percentile=args.clip_percentile,
+                    lloyd_iter=args.lloyd_iter,
+                    chunk_groups=args.chunk_groups,
+                    layer_regex=args.layer_regex,
+                    out_dir=str(step1_out_dir),
+                    python_exe=args.python_exe,
+                )
             )
+
+        step2_skipped = False
+        if args.skip_existing_steps and _step2_output_ready(step2_out_path):
+            step2_skipped = True
+            print(f"[step0] bit={bit} step2 skip (found: {step2_out_path})")
+        else:
+            run_step02(
+                Step02CalibConfig(
+                    model_name=args.model_id,
+                    out_calib_s=str(step2_out_path),
+                    bits=int(bit),
+                    group_size=int(args.group_size),
+                    group_size_1=args.group_size_1,
+                    group_size_2=args.group_size_2,
+                    group_size_3=args.group_size_3,
+                    group_size_4=args.group_size_4,
+                    dataset=args.dataset,
+                    dataset_config=args.dataset_config,
+                    subset=args.subset,
+                    split=args.split,
+                    use_streaming=bool(args.use_streaming),
+                    seq_len=args.seq_len,
+                    nsamples=args.nsamples,
+                    batch_size=args.batch_size,
+                    device=args.device,
+                    device_map=args.device_map,
+                    num_gpus=args.step2_num_gpus,
+                    trust_remote_code=bool(args.trust_remote_code),
+                    cov_mode=args.cov_mode,
+                    eps=args.eps,
+                    tag=f"step0_bit{bit}",
+                    seed=args.seed,
+                    python_exe=args.python_exe,
+                )
+            )
+
+        step3_model_device_map = (
+            args.device_map if args.step3_model_device_map is None else args.step3_model_device_map
         )
 
-        run_step02(
-            Step02CalibConfig(
-                model_name=args.model_id,
-                out_calib_s=str(step2_out_path),
-                bits=int(bit),
-                group_size=int(args.group_size),
-                group_size_1=args.group_size_1,
-                group_size_2=args.group_size_2,
-                group_size_3=args.group_size_3,
-                group_size_4=args.group_size_4,
-                dataset=args.dataset,
-                dataset_config=args.dataset_config,
-                subset=args.subset,
-                split=args.split,
-                use_streaming=bool(args.use_streaming),
-                seq_len=args.seq_len,
-                nsamples=args.nsamples,
-                batch_size=args.batch_size,
-                device=args.device,
-                device_map=args.device_map,
-                trust_remote_code=bool(args.trust_remote_code),
-                cov_mode=args.cov_mode,
-                eps=args.eps,
-                tag=f"step0_bit{bit}",
-                seed=args.seed,
-                python_exe=args.python_exe,
-            )
-        )
+        step3_skipped = False
+        step3_outs = None
+        if args.skip_existing_steps:
+            step3_outs = _find_existing_step3_outputs(step3_out_root, study_name)
+            if step3_outs is not None:
+                step3_skipped = True
+                print(f"[step0] bit={bit} step3 skip (reuse run: {step3_outs['run_dir']})")
 
-        step3_outs = run_step03(
-            Step03BOConfig(
-                model_id=args.model_id,
-                revision=args.revision,
-                trust_remote_code=bool(args.trust_remote_code),
-                step1_dir=str(step1_out_dir),
-                calib_s=str(step2_out_path),
-                out_root=str(step3_out_root),
-                device=args.device,
-                eval_device=(f"{args.device}:0" if args.device == "cuda" else args.device),
-                dtype_w=args.dtype_w,
-                rank_ab=rank_ab,
-                outer_loops=args.outer_loops,
-                delta_steps=args.delta_steps,
-                eps=args.eps,
-                layer_regex=args.layer_regex,
-                log_every=args.log_every,
-                lr_min_ratio=args.lr_min_ratio,
-                lr_step_gamma=args.lr_step_gamma,
-                study_name=study_name,
-                seed=args.seed,
-                stage1_max_blocks=args.stage1_max_blocks,
-                stage1_n_trials=args.stage1_n_trials,
-                stage1_timeout_sec=args.stage1_timeout_sec,
-                stage1_storage=args.stage1_storage,
-                prune_min_layers=args.prune_min_layers,
-                prune_warmup_steps=args.prune_warmup_steps,
-                pruner_startup_trials=args.pruner_startup_trials,
-                pruner_interval_steps=args.pruner_interval_steps,
-                python_exe=args.python_exe,
+        if step3_outs is None:
+            step3_outs = run_step03(
+                Step03BOConfig(
+                    model_id=args.model_id,
+                    revision=args.revision,
+                    trust_remote_code=bool(args.trust_remote_code),
+                    step1_dir=str(step1_out_dir),
+                    calib_s=str(step2_out_path),
+                    out_root=str(step3_out_root),
+                    device=args.device,
+                    eval_device=(f"{args.device}:0" if args.device == "cuda" else args.device),
+                    model_device_map=step3_model_device_map,
+                    dtype_w=args.dtype_w,
+                    rank_ab=rank_ab,
+                    outer_loops=args.outer_loops,
+                    delta_steps=args.delta_steps,
+                    eps=args.eps,
+                    layer_regex=args.layer_regex,
+                    log_every=args.log_every,
+                    lr_min_ratio=args.lr_min_ratio,
+                    lr_step_gamma=args.lr_step_gamma,
+                    study_name=study_name,
+                    seed=args.seed,
+                    stage1_max_blocks=args.stage1_max_blocks,
+                    stage1_n_trials=args.stage1_n_trials,
+                    stage1_timeout_sec=args.stage1_timeout_sec,
+                    stage1_storage=args.stage1_storage,
+                    prune_min_layers=args.prune_min_layers,
+                    prune_warmup_steps=args.prune_warmup_steps,
+                    pruner_startup_trials=args.pruner_startup_trials,
+                    pruner_interval_steps=args.pruner_interval_steps,
+                    python_exe=args.python_exe,
+                )
             )
-        )
 
         raw_paths = _copy_best_raw(
             bit=bit,
@@ -389,11 +508,12 @@ def main() -> None:
             out_root=out_root,
         )
 
+        calib_s_for_export = _resolve_calib_s_for_export(step2_out_path, step3_outs)
         export_stats = export_prebake_from_step3(
             bit=bit,
             wdq_path=Path(raw_paths["wdq_star_best"]),
             uvab_path=Path(raw_paths["lowrank_uv_ab_best"]),
-            calib_s_path=step2_out_path,
+            calib_s_path=calib_s_for_export,
             out_root=out_root,
         )
 
@@ -401,8 +521,11 @@ def main() -> None:
             "bit": int(bit),
             "group_size": group_size,
             "rank_ab": rank_ab,
+            "step1_skipped": bool(step1_skipped),
+            "step2_skipped": bool(step2_skipped),
+            "step3_skipped": bool(step3_skipped),
             "step1_out_dir": str(step1_out_dir),
-            "step2_out_calib_s": str(step2_out_path),
+            "step2_out_calib_s": str(calib_s_for_export),
             "step3_run_dir": str(step3_outs["run_dir"]),
             "step3_stage2_dir": str(step3_outs["stage2_dir"]),
             "best_raw": raw_paths,
@@ -436,9 +559,15 @@ def main() -> None:
         "split": args.split,
         "nsamples": int(args.nsamples),
         "seq_len": int(args.seq_len),
+        "step2_num_gpus": int(args.step2_num_gpus),
         "dtype": args.dtype,
         "dtype_w": args.dtype_w,
         "device": args.device,
+        "device_map": args.device_map,
+        "step3_model_device_map": (
+            args.device_map if args.step3_model_device_map is None else args.step3_model_device_map
+        ),
+        "skip_existing_steps": bool(args.skip_existing_steps),
         "created": run_started,
         "note": "Integrated joint step1/2/3 best outputs exported in step4_prebake-compatible per-module format.",
     }
