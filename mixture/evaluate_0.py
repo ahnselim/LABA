@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=1 \
 python evaluate_0.py \
   --prebake_root ./output_q3_8b/output_step0_prebake \
   --model_name Qwen/Qwen3-8B \
-  --bits 2 \
+  --bits 4 \
   --device cuda:0 \
   --compare_wdq_only
 

@@ -24,30 +24,29 @@ unset TRANSFORMERS_CACHE
 # 캐시가 이미 다 있으면 오프라인 유지
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-CUDA_VISIBLE_DEVICES=1,0 nohup \
+CUDA_VISIBLE_DEVICES=2 nohup \
 python step0_optimization.py \
-  --model_id meta-llama/Llama-2-13b-hf \
-  --out_root ./output_13b/output_step0_prebake \
+  --model_id mistralai/Mistral-7B-v0.3 \
+  --out_root ./mistral_7b/output_step0_prebake \
   --group_size_1 128 --group_size_2 128 --group_size_3 128 --group_size_4 128 \
   --rank_ab_1 64 --rank_ab_2 64 --rank_ab_3 64 --rank_ab_4 64 \
   --stage1_max_blocks 8 --stage1_n_trials 20 \
   --nsamples 64 --seq_len 2048 \
   --device cuda:0 \
   --device_map auto \
-  --step2_num_gpus 2 \
   --step3_model_device_map none \
-  --trust_remote_code > ./logs/step0_13b.log 2>&1 &
+  --trust_remote_code > ./logs/step0_mistral.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=3 nohup \
+CUDA_VISIBLE_DEVICES=1,2 nohup \
 python step0_optimization.py \
-  --model_id huggyllama/llama-7b \
-  --out_root ./output_7b/output_step0_prebake \
-  --group_size_4 128 \
-  --rank_ab_4 64 \
-   --bits 4 \
+  --model_id meta-llama/Llama-2-13b-hf \
+  --out_root ./output_13b/output_step0_prebake \
+--group_size_2 128 --group_size_3 128 --group_size_4 128 \
+--rank_ab_2 64 --rank_ab_3 64 --rank_ab_4 64 \
+   --bits 2 3 4 \
   --stage1_max_blocks 8 --stage1_n_trials 20 \
   --nsamples 64 --seq_len 2048 \
-  --trust_remote_code > ./logs/step0_4bit.log 2>&1 &
+  --trust_remote_code > ./logs/step0_bit.log 2>&1 &
 """
 
 from __future__ import annotations
