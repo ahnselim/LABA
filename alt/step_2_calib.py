@@ -15,9 +15,9 @@ Mixture step0 module: Step0-2 calibration for right-weight diagonal statistics.
 참고:
   - `LABA/mixture/step0_optimization.py`와의 호환을 위해 래퍼 API를 함께 제공한다.
   
-CUDA_VISIBLE_DEVICES=1,2,3 python /ssd/ssd4/asl/LABA/mixture/joint/step0_2_calib.py \
-  --model_name meta-llama/Llama-2-13b-hf \
-  --out_calib_s ./output_13b/output_step0_prebake/bit3/step2_calib/calib_sqrtdiag.pt \
+CUDA_VISIBLE_DEVICES=1 python step_2_calib.py \
+  --model_name meta-llama/Llama-3.1-8B \
+  --out_calib_s ./output/llama3_8b/calib_sqrtdiag.pt \
   --dataset DKYoon/SlimPajama-6B \
   --split train \
   --use_streaming true \

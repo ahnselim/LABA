@@ -13,10 +13,11 @@ Output layout:
     best_raw/bit1/lowrank_uv_ab_best.pt
     summaries/bit1.json
     summaries/summary.json
-    
+ 
+CUDA_VISIBLE_DEVICES=1 nohup \
 python step0_opt_1bit.py \
   --model_id mistralai/Mistral-7B-v0.3 \
-  --out_root /ssd/ssd4/asl/LABA/mixture/output_step0_1bit \
+  --out_root ./mistral_7b/output_step0_1bit \
   --group_size 128 \
   --rank_ab 64 \
   --stage1_max_blocks 8 \
@@ -26,7 +27,7 @@ python step0_opt_1bit.py \
   --device cuda \
   --device_map auto \
   --step3_model_device_map none \
-  --trust_remote_code
+  --trust_remote_code > ./logs/mistral_1bit.log 2>&1 &
 
 """
 

@@ -1,61 +1,54 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Integrated greedy pipeline for mixture outputs:
+Integrated greedy pipeline for mixed ablation outputs:
   step1_1_sensitivity -> step1_2_alpha_estimation(prebake-aware) -> step1_3c_opt
 
-Inputs:
-  - step0_optimization output root (`bit1..bit4/`, `meta.json`)
-Outputs:
-  - out_root/step1_1/*
-  - out_root/step1_2/*
-  - out_root/step1_3/*
-  - out_root/meta.json
-
-export HF_HOME=/ssd/ssd4/asl/.cache
-export HF_HUB_CACHE=/ssd/ssd4/asl/.cache/hub
-export HF_DATASETS_CACHE=/ssd/ssd4/asl/.cache/datasets
-unset TRANSFORMERS_CACHE
-
-# 캐시가 이미 다 있으면 오프라인 유지
-export HF_HUB_OFFLINE=1
-export HF_DATASETS_OFFLINE=1
-
-CUDA_VISIBLE_DEVICES=2,1,0 nohup \
-python step1_greedy_optimization.py \
-  --model_id mistralai/Mistral-7B-v0.3 \
-  --step0_out_root ./mistral_7b/output_step0_prebake \
-  --out_root ./mistral_7b/output_step1_greedy \
-  --alpha_reuse_calib \
-  --bitopt_mode budget \
-  --avg_bits 2.25 \
-  --sens_device_map auto \
-  --alpha_device_map auto \
-  --trust_remote_code > ./logs/mistral_7b_step1.log 2>&1 &
-
+This variant uses the ablation scripts under `LABA/mixture/1bit/` and supports
+mixing prebake roots:
+  - bits 2/3/4 can stay on the baseline step0 root
+  - bit 1 can be overridden to the mu-beta 1-bit ablation step0 root
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+
 
 _THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
+_ONEBIT_DIR = _THIS_DIR / "1bit"
+for _path in (str(_THIS_DIR), str(_ONEBIT_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
-if __package__:
-    from .cvx.step1_1_sensitivity import Step11SensitivityConfig, run as run_step11
-    from .cvx.step1_2_alpha_estimation import Step12AlphaPrebakeConfig, run as run_step12
-    from .cvx.step1_3c_opt import Step13COptConfig, run as run_step13
-else:
-    from cvx.step1_1_sensitivity import Step11SensitivityConfig, run as run_step11
-    from cvx.step1_2_alpha_estimation import Step12AlphaPrebakeConfig, run as run_step12
-    from cvx.step1_3c_opt import Step13COptConfig, run as run_step13
+
+def _load_1bit_step_modules():
+    m11 = importlib.import_module("step1_1_sensitivity")
+    m12 = importlib.import_module("step1_2_alpha_estimation")
+    m13 = importlib.import_module("step1_3c_opt")
+    return (
+        m11.Step11SensitivityConfig,
+        m11.run,
+        m12.Step12AlphaPrebakeConfig,
+        m12.run,
+        m13.Step13COptConfig,
+        m13.run,
+    )
+
+
+(
+    Step11SensitivityConfig,
+    run_step11,
+    Step12AlphaPrebakeConfig,
+    run_step12,
+    Step13COptConfig,
+    run_step13,
+) = _load_1bit_step_modules()
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -65,9 +58,14 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Integrated mixture greedy step1 pipeline (1_1 -> 1_2 -> 1_3)")
+    ap = argparse.ArgumentParser("Integrated mixture greedy step1 pipeline with bit1-diff ablation")
     ap.add_argument("--model_id", required=True)
-    ap.add_argument("--step0_out_root", required=True, help="Output root from mixture/step0_optimization.py")
+    ap.add_argument("--step0_out_root", required=True, help="Baseline step0 output root used by default")
+    ap.add_argument(
+        "--step0_out_root_bit1",
+        default=None,
+        help="Optional override step0 root for bit1 only (e.g. mu-beta 1-bit ablation root)",
+    )
     ap.add_argument("--out_root", required=True)
     ap.add_argument("--revision", default=None)
     ap.add_argument("--trust_remote_code", action="store_true")
@@ -149,6 +147,12 @@ def main() -> None:
     if not (step0_root / "bit1").exists():
         raise FileNotFoundError(f"{step0_root} does not look like a step0 prebake root (missing bit1/)")
 
+    step0_root_bit1 = step0_root if args.step0_out_root_bit1 is None else Path(args.step0_out_root_bit1).resolve()
+    if not step0_root_bit1.exists():
+        raise FileNotFoundError(f"step0_out_root_bit1 not found: {step0_root_bit1}")
+    if not (step0_root_bit1 / "bit1").exists():
+        raise FileNotFoundError(f"{step0_root_bit1} does not contain bit1/ for the bit1 override")
+
     out_root = Path(args.out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     d11 = out_root / "step1_1"
@@ -165,7 +169,7 @@ def main() -> None:
     )
 
     t0 = time.time()
-    print("[step1-greedy] Running step1_1_sensitivity ...")
+    print("[step1-greedy-bit1-diff] Running step1_1_sensitivity ...")
     run_step11(
         Step11SensitivityConfig(
             model_id=args.model_id,
@@ -194,11 +198,12 @@ def main() -> None:
     if not sens_csv.exists():
         raise RuntimeError(f"step1_1 output missing: {sens_csv}")
 
-    print("[step1-greedy] Running step1_2_alpha_estimation (prebake-aware) ...")
+    print("[step1-greedy-bit1-diff] Running step1_2_alpha_estimation (mixed prebake-aware) ...")
     alpha_outs = run_step12(
         Step12AlphaPrebakeConfig(
             model_id=args.model_id,
             prebake_root=str(step0_root),
+            prebake_root_bit1=str(step0_root_bit1),
             output_dir=str(d12),
             revision=args.revision,
             trust_remote_code=bool(args.trust_remote_code),
@@ -229,7 +234,7 @@ def main() -> None:
     else:
         bits = str(args.bits)
 
-    print("[step1-greedy] Running step1_3c_opt ...")
+    print("[step1-greedy-bit1-diff] Running step1_3c_opt ...")
     run_step13(
         Step13COptConfig(
             sens_csv=str(sens_csv),
@@ -265,6 +270,7 @@ def main() -> None:
         "model_id": args.model_id,
         "revision": args.revision,
         "step0_out_root": str(step0_root),
+        "step0_out_root_bit1": str(step0_root_bit1),
         "out_root": str(out_root),
         "created": int(time.time()),
         "elapsed_sec": time.time() - t0,
@@ -279,11 +285,11 @@ def main() -> None:
             "bit_assign_csv": str(bit_assign_csv),
             "bit_assign_meta": str(d13 / "bit_assign_meta.txt"),
         },
-        "alpha_mode": "actual_post_ab_over_quant (prebake-aware)",
+        "alpha_mode": "actual_post_ab_over_quant (mixed prebake-aware; bit1 override supported)",
     }
     _write_json(out_root / "meta.json", meta)
 
-    print("[step1-greedy] COMPLETED")
+    print("[step1-greedy-bit1-diff] COMPLETED")
     print(f"  out_root      : {out_root}")
     print(f"  sens_csv      : {sens_csv}")
     print(f"  alpha_csv     : {alpha_csv}")

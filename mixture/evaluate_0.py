@@ -20,9 +20,9 @@ and reuses the existing joint eval utilities for injection + PPL.
 
 CUDA_VISIBLE_DEVICES=1 \
 python evaluate_0.py \
-  --prebake_root ./output_q3_8b/output_step0_prebake \
-  --model_name Qwen/Qwen3-8B \
-  --bits 4 \
+  --prebake_root ./mistral_7b/output_step0_prebake \
+  --model_name mistralai/Mistral-7B-v0.3 \
+  --bits 3 \
   --device cuda:0 \
   --compare_wdq_only
 
