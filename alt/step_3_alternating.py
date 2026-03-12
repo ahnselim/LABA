@@ -21,15 +21,26 @@ Outputs:
   - out_dir/metrics.jsonl
   - out_dir/summary.json
 
-CUDA_VISIBLE_DEVICES=1 nohup \
+CUDA_VISIBLE_DEVICES=2 nohup \
 python step_3_alternating.py \
   --model_id meta-llama/Llama-3.1-8B \
-  --step1_dir ./output/llama3_8b/step1_quant \
+  --step1_dir ./output/llama3_8b/step1_quant/2bit \
   --calib_s ./output/llama3_8b/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_8b/step3_alt \
+  --out_dir ./output/llama3_8b/step3_alt/2bit_10 \
   --qtype hessian-aware \
   --rank_ab 64 \
-  --outer_loops 50 > llama3_8b_2bit.log 2>&1 &
+  --outer_loops 10 > llama3_8b_2bit_10.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=2 nohup python step_3_alternating.py \
+  --model_id meta-llama/Llama-3.1-8B \
+  --step1_dir ./output/llama3_8b/step1_quant/2bit \
+  --calib_s ./output/llama3_8b/calib_sqrtdiag.pt \
+  --out_dir ./output/llama3_8b/step3_alt/2bit_10_sharded \
+  --qtype hessian-aware \
+  --rank_ab 64 \
+  --outer_loops 10 \
+  --weight_source live_model \
+  --save_sharded  > llama3_8b_2bit_10.log 2>&1 &
 
 """
 
@@ -80,6 +91,21 @@ MODULE_ORDER = {
 }
 
 
+def torch_load_cpu(path: Path, *, mmap: bool = False):
+    load_kwargs = {"map_location": "cpu"}
+    if mmap:
+        load_kwargs["mmap"] = True
+    try:
+        return torch.load(path, **load_kwargs)
+    except TypeError:
+        if not mmap:
+            raise
+    except RuntimeError:
+        if not mmap:
+            raise
+    return torch.load(path, map_location="cpu")
+
+
 def set_seed(seed: int) -> None:
     random.seed(int(seed))
     torch.manual_seed(int(seed))
@@ -124,21 +150,14 @@ def rank_r_svd(m: torch.Tensor, r: int) -> Tuple[torch.Tensor, torch.Tensor]:
     r_eff = min(int(r), o, i)
     if r_eff <= 0:
         raise ValueError("rank must be positive")
-    try:
-        u, s, v = torch.linalg.svd_lowrank(m, q=r_eff, niter=2)
-        sroot = torch.sqrt(s.clamp_min(0.0))
-        a = u * sroot.unsqueeze(0)
-        b = sroot.unsqueeze(1) * v.T
-        return a, b
-    except Exception:
-        u, s, vh = torch.linalg.svd(m, full_matrices=False)
-        u = u[:, :r_eff]
-        s = s[:r_eff]
-        vh = vh[:r_eff, :]
-        sroot = torch.sqrt(s.clamp_min(0.0))
-        a = u * sroot.unsqueeze(0)
-        b = sroot.unsqueeze(1) * vh
-        return a, b
+    u, s, vh = torch.linalg.svd(m, full_matrices=False)
+    u = u[:, :r_eff]
+    s = s[:r_eff]
+    vh = vh[:r_eff, :]
+    sroot = torch.sqrt(s.clamp_min(0.0))
+    a = u * sroot.unsqueeze(0)
+    b = sroot.unsqueeze(1) * vh
+    return a, b
 
 
 def load_diag_weight(entry: dict, eps: float) -> torch.Tensor:
@@ -153,6 +172,140 @@ def load_diag_weight(entry: dict, eps: float) -> torch.Tensor:
     else:
         raise KeyError("calib entry must include one of: s, sqrt, var, inv_s")
     return d.clamp_min(float(eps)).contiguous()
+
+
+def move_tensor(
+    tensor: torch.Tensor,
+    device: torch.device,
+    *,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    non_blocking = tensor.device.type == "cpu" and device.type == "cuda"
+    return tensor.to(device=device, dtype=dtype, non_blocking=non_blocking)
+
+
+def maybe_pin_tensor(tensor: torch.Tensor, enabled: bool) -> torch.Tensor:
+    if not enabled or tensor.device.type != "cpu":
+        return tensor
+    if tensor.is_pinned():
+        return tensor
+    return tensor.pin_memory()
+
+
+def resolve_chunk_groups(
+    base_chunk_groups: int,
+    num_group_rows: int,
+    group_size: int,
+    levels: int,
+    device: torch.device,
+    auto_tune: bool,
+) -> int:
+    chunk = max(1, int(base_chunk_groups))
+    if num_group_rows <= chunk or device.type != "cuda" or not auto_tune:
+        return max(1, min(chunk, int(num_group_rows)))
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        return max(1, min(chunk, int(num_group_rows)))
+
+    approx_bytes_per_row = (int(group_size) * (int(levels) + 16) * 4) + (int(levels) * 64)
+    budget = max(approx_bytes_per_row, int(free_bytes * 0.05))
+    tuned = max(chunk, budget // max(1, approx_bytes_per_row))
+    return max(1, min(int(num_group_rows), int(tuned)))
+
+
+def prefetch_layer_payload(
+    key: str,
+    ctx: dict,
+    args: argparse.Namespace,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> dict:
+    device = ctx["device"]
+    codebooks = ctx["codebooks"]
+    qcodes_dict = ctx["qcodes"]
+    metas = ctx["metas"]
+    calib_s = ctx["calib_s"]
+    state = ctx["state"]
+
+    meta = metas[key]
+    bits = int(meta["bits"])
+    gs = int(meta["group_size"])
+    orig_i = int(tuple(meta["orig_shape"])[1])
+    clip_pct = float(meta.get("clip_percentile", 0.0) if args.clip_percentile is None else args.clip_percentile)
+
+    if state is not None:
+        weight_src = state[key]
+    else:
+        param_map = ctx.get("param_map")
+        if param_map is None or key not in param_map:
+            raise KeyError(f"missing live weight for {key}")
+        weight_src = param_map[key].detach()
+    d_cpu = load_diag_weight(calib_s[key], eps=float(args.eps))
+    if d_cpu.numel() != orig_i:
+        raise RuntimeError(f"diag weight shape mismatch on {key}: expected {orig_i}, got {d_cpu.numel()}")
+    if weight_src.shape[1] != orig_i:
+        raise RuntimeError(f"orig_I mismatch on {key}: meta={orig_i}, weight={weight_src.shape[1]}")
+
+    pin_host = bool(args.pin_host_buffers and device.type == "cuda")
+    weight_host = maybe_pin_tensor(weight_src, pin_host)
+    d_host = maybe_pin_tensor(d_cpu, pin_host)
+    reuse_step1_init = should_reuse_step1_init(meta, args.qtype)
+    codebook_host = None
+    qcodes_host = None
+    if reuse_step1_init:
+        codebook_host = maybe_pin_tensor(codebooks[key], pin_host)
+        qcodes_host = maybe_pin_tensor(qcodes_dict[key], pin_host)
+
+    levels = 1 << bits
+    num_group_rows = int(meta["O"]) * int(meta["G"])
+    effective_chunk_groups = resolve_chunk_groups(
+        base_chunk_groups=int(args.chunk_groups),
+        num_group_rows=num_group_rows,
+        group_size=gs,
+        levels=levels,
+        device=device,
+        auto_tune=bool(args.chunk_groups_auto),
+    )
+
+    payload = {
+        "key": key,
+        "bits": bits,
+        "group_size": gs,
+        "orig_i": orig_i,
+        "clip_pct": clip_pct,
+        "chunk_groups": int(effective_chunk_groups),
+        "reuse_step1_init": bool(reuse_step1_init),
+        "ready_event": None,
+    }
+
+    def _materialize() -> None:
+        w = move_tensor(weight_host, device, dtype=torch.float32)
+        d = move_tensor(d_host, device, dtype=torch.float32)
+        payload["w"] = w
+        payload["d"] = d
+        payload["hdiag"] = (d * d) if args.qtype == "hessian-aware" else None
+        if reuse_step1_init:
+            payload["codebook"] = move_tensor(codebook_host, device, dtype=torch.float32)
+            payload["qcodes"] = move_tensor(qcodes_host, device)
+
+    if stream is not None and device.type == "cuda":
+        with torch.cuda.stream(stream):
+            _materialize()
+        ready_event = torch.cuda.Event()
+        ready_event.record(stream)
+        payload["ready_event"] = ready_event
+    else:
+        _materialize()
+
+    return payload
+
+
+def wait_for_prefetch(payload: dict, device: torch.device) -> None:
+    event = payload.get("ready_event")
+    if event is None or device.type != "cuda":
+        return
+    torch.cuda.current_stream(device=device).wait_event(event)
+    payload["ready_event"] = None
 
 
 @torch.no_grad()
@@ -189,6 +342,43 @@ def append_jsonl(path: Path, rec: dict) -> None:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def sanitize_key_filename(key: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key).strip("._")
+    return safe or "layer"
+
+
+def save_sharded_artifact(
+    out_dir: Path,
+    artifact_name: str,
+    layer_index: int,
+    key: str,
+    value,
+    manifest_store: Dict[str, List[dict]],
+) -> None:
+    artifact_dir = out_dir / artifact_name
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"{int(layer_index):04d}_{sanitize_key_filename(key)}.pt"
+    torch.save(value, artifact_dir / fname)
+    manifest_store.setdefault(artifact_name, []).append({"key": key, "file": fname})
+
+
+def write_sharded_manifests(
+    out_dir: Path,
+    manifest_store: Dict[str, List[dict]],
+) -> None:
+    for artifact_name, entries in manifest_store.items():
+        artifact_dir = out_dir / artifact_name
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "format": "sharded-v1",
+            "artifact": artifact_name,
+            "count": len(entries),
+            "entries": entries,
+        }
+        with open(artifact_dir / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
 def should_reuse_step1_init(meta: dict, qtype: str) -> bool:
     weighted = bool(meta.get("uses_hessian_weighting", False))
     if qtype == "hessian-aware":
@@ -205,12 +395,12 @@ def load_context(args: argparse.Namespace) -> dict:
         raise FileNotFoundError("step1_dir must contain codebook.pt, qcodes.pt, meta.pt")
 
     print(f"[Alt-Step3] loading step1 artifacts: {step1_dir}")
-    codebooks: Dict[str, torch.Tensor] = torch.load(codebook_path, map_location="cpu")
-    qcodes: Dict[str, torch.Tensor] = torch.load(qcodes_path, map_location="cpu")
-    metas: Dict[str, dict] = torch.load(meta_path, map_location="cpu")
+    codebooks: Dict[str, torch.Tensor] = torch_load_cpu(codebook_path, mmap=bool(args.artifact_mmap))
+    qcodes: Dict[str, torch.Tensor] = torch_load_cpu(qcodes_path, mmap=bool(args.artifact_mmap))
+    metas: Dict[str, dict] = torch_load_cpu(meta_path, mmap=bool(args.artifact_mmap))
 
     print(f"[Alt-Step3] loading calib_s: {args.calib_s}")
-    calib_s: Dict[str, dict] = torch.load(args.calib_s, map_location="cpu")
+    calib_s: Dict[str, dict] = torch_load_cpu(Path(args.calib_s), mmap=bool(args.artifact_mmap))
 
     if args.dtype_w == "fp16":
         load_dtype = torch.float16
@@ -235,40 +425,58 @@ def load_context(args: argparse.Namespace) -> dict:
         device_map=resolved_model_device_map,
         low_cpu_mem_usage=True,
     )
-    try:
-        state = _snapshot_state_to_cpu(model)
-        del model
-    except NotImplementedError:
-        if resolved_model_device_map is None:
-            raise
-        print("[Alt-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+    state: Optional[Dict[str, torch.Tensor]] = None
+    model_ref = None
+    param_map: Optional[Dict[str, torch.nn.Parameter]] = None
+    if args.weight_source == "snapshot_cpu":
+        try:
+            state = _snapshot_state_to_cpu(model)
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        except NotImplementedError:
+            if resolved_model_device_map is None:
+                raise
+            print("[Alt-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
-            revision=args.revision,
-            torch_dtype=(load_dtype if load_dtype in (torch.float16, torch.bfloat16) else None),
-            trust_remote_code=args.trust_remote_code,
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
-        state = _snapshot_state_to_cpu(model)
-        del model
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_id,
+                revision=args.revision,
+                torch_dtype=(load_dtype if load_dtype in (torch.float16, torch.bfloat16) else None),
+                trust_remote_code=args.trust_remote_code,
+                device_map="cpu",
+                low_cpu_mem_usage=True,
+            )
+            state = _snapshot_state_to_cpu(model)
+            del model
+            gc.collect()
+    else:
+        model_ref = model
+        param_map = dict(model.named_parameters())
 
     layer_re = re.compile(args.layer_regex) if args.layer_regex else None
     keys: List[str] = []
     for key in codebooks.keys():
-        if key not in qcodes or key not in metas or key not in calib_s or key not in state:
+        if key not in qcodes or key not in metas or key not in calib_s:
             continue
-        if not is_target_weight(key, state[key]):
-            continue
+        if state is not None:
+            if key not in state or not is_target_weight(key, state[key]):
+                continue
+        else:
+            if param_map is None or key not in param_map:
+                continue
+            if getattr(param_map[key], "is_meta", False):
+                raise RuntimeError(
+                    f"meta tensor detected for {key} under live_model mode. "
+                    "Use --weight_source snapshot_cpu or reload model without offloaded meta tensors."
+                )
+            if not is_target_weight(key, param_map[key]):
+                continue
         if layer_re and not layer_re.search(key):
             continue
         keys.append(key)
@@ -287,43 +495,31 @@ def load_context(args: argparse.Namespace) -> dict:
         "metas": metas,
         "calib_s": calib_s,
         "state": state,
+        "model": model_ref,
+        "param_map": param_map,
         "keys": keys,
     }
 
 
 def optimize_layer(
-    key: str,
-    ctx: dict,
+    payload: dict,
     args: argparse.Namespace,
     metrics_path: Path,
 ) -> dict:
-    device = ctx["device"]
-    codebooks = ctx["codebooks"]
-    qcodes_dict = ctx["qcodes"]
-    metas = ctx["metas"]
-    calib_s = ctx["calib_s"]
-    state = ctx["state"]
+    key = payload["key"]
+    bits = int(payload["bits"])
+    gs = int(payload["group_size"])
+    orig_i = int(payload["orig_i"])
+    clip_pct = float(payload["clip_pct"])
+    chunk_groups = int(payload["chunk_groups"])
 
-    meta = metas[key]
-    bits = int(meta["bits"])
-    gs = int(meta["group_size"])
-    orig_i = int(tuple(meta["orig_shape"])[1])
-    clip_pct = float(meta.get("clip_percentile", 0.0) if args.clip_percentile is None else args.clip_percentile)
+    w = payload["w"]
+    d = payload["d"]
+    hdiag = payload["hdiag"]
 
-    w_cpu = state[key].to(torch.float32)
-    d_cpu = load_diag_weight(calib_s[key], eps=float(args.eps))
-    if d_cpu.numel() != orig_i:
-        raise RuntimeError(f"diag weight shape mismatch on {key}: expected {orig_i}, got {d_cpu.numel()}")
-    if w_cpu.shape[1] != orig_i:
-        raise RuntimeError(f"orig_I mismatch on {key}: meta={orig_i}, weight={w_cpu.shape[1]}")
-
-    w = w_cpu.to(device)
-    d = d_cpu.to(device)
-    hdiag = (d * d) if args.qtype == "hessian-aware" else None
-
-    if should_reuse_step1_init(meta, args.qtype):
-        codebook = codebooks[key].to(device=device, dtype=torch.float32)
-        qcodes = qcodes_dict[key].to(device=device)
+    if payload["reuse_step1_init"]:
+        codebook = payload["codebook"]
+        qcodes = payload["qcodes"]
         wq = dequant_from_codebook_codes(codebook, qcodes, orig_i=orig_i)
         init_source = "step1_artifact"
     else:
@@ -333,7 +529,7 @@ def optimize_layer(
             group_size=gs,
             clip_pct=clip_pct,
             lloyd_iter=int(args.lloyd_iter),
-            chunk_groups=int(args.chunk_groups),
+            chunk_groups=chunk_groups,
             hessian_diag=hdiag,
         )
         init_source = "recomputed"
@@ -361,6 +557,7 @@ def optimize_layer(
             "rank_ab": int(args.rank_ab),
             "qtype": args.qtype,
             "init_source": init_source,
+            "chunk_groups": chunk_groups,
         },
     )
 
@@ -370,6 +567,7 @@ def optimize_layer(
         "clip_percentile": float(clip_pct),
         "qtype": str(args.qtype),
         "init_source": str(init_source),
+        "chunk_groups": chunk_groups,
     }
 
     for outer in range(int(args.outer_loops)):
@@ -381,12 +579,13 @@ def optimize_layer(
             group_size=gs,
             clip_pct=clip_pct,
             lloyd_iter=int(args.lloyd_iter),
-            chunk_groups=int(args.chunk_groups),
+            chunk_groups=chunk_groups,
             hessian_diag=hdiag,
         )
         final_quant_meta = dict(quant_meta)
         final_quant_meta["qtype"] = str(args.qtype)
         final_quant_meta["clip_percentile"] = float(clip_pct)
+        final_quant_meta["chunk_groups"] = chunk_groups
         obj = weighted_objective(w, wq, a, b, d)
 
         append_jsonl(
@@ -400,6 +599,7 @@ def optimize_layer(
                 "group_size": gs,
                 "rank_ab": int(args.rank_ab),
                 "qtype": args.qtype,
+                "chunk_groups": chunk_groups,
             },
         )
 
@@ -423,6 +623,7 @@ def optimize_layer(
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
+                "chunk_groups": chunk_groups,
                 "objective_weighted_final": float(final_obj),
             },
         },
@@ -435,6 +636,7 @@ def optimize_layer(
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
+                "chunk_groups": chunk_groups,
                 "best_outer": int(best["outer"]),
                 "objective_weighted_best": float(best["objective"]),
             },
@@ -446,6 +648,7 @@ def optimize_layer(
             "layer": key,
             "bits": bits,
             "group_size": gs,
+            "chunk_groups": chunk_groups,
             "init_source": init_source,
             "objective_weighted_final": float(final_obj),
             "objective_weighted_best": float(best["objective"]),
@@ -467,18 +670,34 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--model_device_map", default="auto", help='Model load placement: e.g. "auto" or "none"')
     ap.add_argument("--dtype_w", default="fp16", choices=["fp16", "bf16", "fp32"])
+    ap.add_argument("--weight_source", default="snapshot_cpu", choices=["snapshot_cpu", "live_model"])
+    ap.add_argument("--artifact_mmap", dest="artifact_mmap", action="store_true")
+    ap.add_argument("--no_artifact_mmap", dest="artifact_mmap", action="store_false")
 
     ap.add_argument("--qtype", default="hessian-aware", choices=["plain", "hessian-aware"])
     ap.add_argument("--rank_ab", type=int, default=64)
     ap.add_argument("--outer_loops", type=int, default=4)
     ap.add_argument("--lloyd_iter", type=int, default=12)
     ap.add_argument("--chunk_groups", type=int, default=4096)
+    ap.add_argument("--chunk_groups_auto", dest="chunk_groups_auto", action="store_true")
+    ap.add_argument("--no_chunk_groups_auto", dest="chunk_groups_auto", action="store_false")
+    ap.add_argument("--prefetch_next_layer", dest="prefetch_next_layer", action="store_true")
+    ap.add_argument("--no_prefetch_next_layer", dest="prefetch_next_layer", action="store_false")
+    ap.add_argument("--pin_host_buffers", dest="pin_host_buffers", action="store_true")
+    ap.add_argument("--no_pin_host_buffers", dest="pin_host_buffers", action="store_false")
     ap.add_argument("--clip_percentile", type=float, default=None)
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--layer_regex", type=str, default=None)
     ap.add_argument("--max_layers", type=int, default=0)
     ap.add_argument("--save_every_layer", action="store_true")
+    ap.add_argument("--save_sharded", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.set_defaults(
+        chunk_groups_auto=True,
+        prefetch_next_layer=True,
+        pin_host_buffers=True,
+        artifact_mmap=True,
+    )
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -499,21 +718,48 @@ def main() -> None:
     qcodes_out: Dict[str, torch.Tensor] = {}
     quant_meta_out: Dict[str, dict] = {}
     layer_summaries: List[dict] = []
+    shard_manifests: Dict[str, List[dict]] = {}
+
+    prefetch_stream: Optional[torch.cuda.Stream] = None
+    if ctx["device"].type == "cuda" and args.prefetch_next_layer:
+        prefetch_stream = torch.cuda.Stream(device=ctx["device"])
+
+    keys = ctx["keys"]
+    current_payload = prefetch_layer_payload(keys[0], ctx=ctx, args=args, stream=None)
 
     t0 = time.time()
-    for idx, key in enumerate(ctx["keys"], start=1):
-        print(f"[Alt-Step3] ({idx}/{len(ctx['keys'])}) optimizing: {key}")
-        layer_res = optimize_layer(key=key, ctx=ctx, args=args, metrics_path=metrics_path)
-        wdq_out[key] = layer_res["wdq"]
-        ab_out[key] = layer_res["low_rank_ab"]
-        wdq_best_out[key] = layer_res["wdq_best"]
-        ab_best_out[key] = layer_res["low_rank_ab_best"]
-        codebook_out[key] = layer_res["codebook"]
-        qcodes_out[key] = layer_res["qcodes"]
-        quant_meta_out[key] = layer_res["quant_meta"]
+    for idx, key in enumerate(keys, start=1):
+        next_payload = None
+        if idx < len(keys):
+            next_key = keys[idx]
+            if prefetch_stream is not None:
+                next_payload = prefetch_layer_payload(next_key, ctx=ctx, args=args, stream=prefetch_stream)
+
+        wait_for_prefetch(current_payload, ctx["device"])
+        print(
+            f"[Alt-Step3] ({idx}/{len(keys)}) optimizing: {key} "
+            f"(chunk_groups={current_payload['chunk_groups']})"
+        )
+        layer_res = optimize_layer(payload=current_payload, args=args, metrics_path=metrics_path)
+        if args.save_sharded:
+            save_sharded_artifact(out_dir, "wdq_star", idx, key, layer_res["wdq"], shard_manifests)
+            save_sharded_artifact(out_dir, "low_rank_ab", idx, key, layer_res["low_rank_ab"], shard_manifests)
+            save_sharded_artifact(out_dir, "wdq_star_best", idx, key, layer_res["wdq_best"], shard_manifests)
+            save_sharded_artifact(out_dir, "low_rank_ab_best", idx, key, layer_res["low_rank_ab_best"], shard_manifests)
+            save_sharded_artifact(out_dir, "codebook_star", idx, key, layer_res["codebook"], shard_manifests)
+            save_sharded_artifact(out_dir, "qcodes_star", idx, key, layer_res["qcodes"], shard_manifests)
+            save_sharded_artifact(out_dir, "quant_meta_star", idx, key, layer_res["quant_meta"], shard_manifests)
+        else:
+            wdq_out[key] = layer_res["wdq"]
+            ab_out[key] = layer_res["low_rank_ab"]
+            wdq_best_out[key] = layer_res["wdq_best"]
+            ab_best_out[key] = layer_res["low_rank_ab_best"]
+            codebook_out[key] = layer_res["codebook"]
+            qcodes_out[key] = layer_res["qcodes"]
+            quant_meta_out[key] = layer_res["quant_meta"]
         layer_summaries.append(layer_res["summary"])
 
-        if args.save_every_layer:
+        if args.save_every_layer and not args.save_sharded:
             torch.save(wdq_out, out_dir / "wdq_star.pt")
             torch.save(ab_out, out_dir / "low_rank_ab.pt")
             torch.save(wdq_best_out, out_dir / "wdq_star_best.pt")
@@ -522,18 +768,36 @@ def main() -> None:
             torch.save(qcodes_out, out_dir / "qcodes_star.pt")
             torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
 
-        if torch.cuda.is_available() and (idx % 8 == 0 or idx == len(ctx["keys"])):
+        del layer_res
+        del current_payload
+        if idx < len(keys):
+            if next_payload is None:
+                next_payload = prefetch_layer_payload(keys[idx], ctx=ctx, args=args, stream=None)
+            current_payload = next_payload
+
+        if torch.cuda.is_available() and (idx % 8 == 0 or idx == len(keys)):
             torch.cuda.empty_cache()
-        if idx % 8 == 0 or idx == len(ctx["keys"]):
+        if idx % 8 == 0 or idx == len(keys):
             gc.collect()
 
-    torch.save(wdq_out, out_dir / "wdq_star.pt")
-    torch.save(ab_out, out_dir / "low_rank_ab.pt")
-    torch.save(wdq_best_out, out_dir / "wdq_star_best.pt")
-    torch.save(ab_best_out, out_dir / "low_rank_ab_best.pt")
-    torch.save(codebook_out, out_dir / "codebook_star.pt")
-    torch.save(qcodes_out, out_dir / "qcodes_star.pt")
-    torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
+    if args.save_sharded:
+        write_sharded_manifests(out_dir, shard_manifests)
+    else:
+        torch.save(wdq_out, out_dir / "wdq_star.pt")
+        torch.save(ab_out, out_dir / "low_rank_ab.pt")
+        torch.save(wdq_best_out, out_dir / "wdq_star_best.pt")
+        torch.save(ab_best_out, out_dir / "low_rank_ab_best.pt")
+        torch.save(codebook_out, out_dir / "codebook_star.pt")
+        torch.save(qcodes_out, out_dir / "qcodes_star.pt")
+        torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
+
+    if ctx.get("model") is not None:
+        del ctx["model"]
+    if ctx.get("param_map") is not None:
+        del ctx["param_map"]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     final_mean = sum(x["objective_weighted_final"] for x in layer_summaries) / max(1, len(layer_summaries))
     best_mean = sum(x["objective_weighted_best"] for x in layer_summaries) / max(1, len(layer_summaries))
@@ -543,11 +807,17 @@ def main() -> None:
         "step1_dir": str(Path(args.step1_dir).resolve()),
         "calib_s": str(Path(args.calib_s).resolve()),
         "out_dir": str(out_dir),
+        "weight_source": str(args.weight_source),
+        "artifact_mmap": bool(args.artifact_mmap),
         "qtype": str(args.qtype),
         "rank_ab": int(args.rank_ab),
         "outer_loops": int(args.outer_loops),
         "lloyd_iter": int(args.lloyd_iter),
         "chunk_groups": int(args.chunk_groups),
+        "chunk_groups_auto": bool(args.chunk_groups_auto),
+        "prefetch_next_layer": bool(args.prefetch_next_layer),
+        "pin_host_buffers": bool(args.pin_host_buffers),
+        "save_sharded": bool(args.save_sharded),
         "clip_percentile_override": args.clip_percentile,
         "num_layers": len(layer_summaries),
         "objective_weighted_final_mean": float(final_mean),
@@ -559,8 +829,12 @@ def main() -> None:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print("[Alt-Step3] saved:")
-    print(f"  wdq*: {out_dir / 'wdq_star.pt'}")
-    print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}")
+    if args.save_sharded:
+        print(f"  wdq*: {out_dir / 'wdq_star'}")
+        print(f"  AB*:  {out_dir / 'low_rank_ab'}")
+    else:
+        print(f"  wdq*: {out_dir / 'wdq_star.pt'}")
+        print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}")
     print(f"  summary: {out_dir / 'summary.json'}")
 
 
@@ -602,16 +876,22 @@ class Step03AlternatingConfig:
     device: str = "cuda"
     model_device_map: str = "auto"
     dtype_w: str = "fp16"
+    weight_source: str = "snapshot_cpu"
+    artifact_mmap: bool = True
     qtype: str = "hessian-aware"
     rank_ab: int = 64
     outer_loops: int = 4
     lloyd_iter: int = 12
     chunk_groups: int = 4096
+    chunk_groups_auto: bool = True
+    prefetch_next_layer: bool = True
+    pin_host_buffers: bool = True
     clip_percentile: Optional[float] = None
     eps: float = 1e-8
     layer_regex: Optional[str] = None
     max_layers: int = 0
     save_every_layer: bool = False
+    save_sharded: bool = False
     seed: int = 42
     python_exe: str = sys.executable
     source_script: str = str(Path(__file__).resolve())
@@ -635,6 +915,8 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         str(cfg.model_device_map),
         "--dtype_w",
         str(cfg.dtype_w),
+        "--weight_source",
+        str(cfg.weight_source),
         "--qtype",
         str(cfg.qtype),
         "--rank_ab",
@@ -652,6 +934,14 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         "--seed",
         str(int(cfg.seed)),
     ]
+    if not cfg.chunk_groups_auto:
+        cmd.append("--no_chunk_groups_auto")
+    if not cfg.prefetch_next_layer:
+        cmd.append("--no_prefetch_next_layer")
+    if not cfg.pin_host_buffers:
+        cmd.append("--no_pin_host_buffers")
+    if not cfg.artifact_mmap:
+        cmd.append("--no_artifact_mmap")
     if cfg.revision:
         cmd += ["--revision", str(cfg.revision)]
     if cfg.trust_remote_code:
@@ -662,6 +952,8 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         cmd += ["--layer_regex", str(cfg.layer_regex)]
     if cfg.save_every_layer:
         cmd.append("--save_every_layer")
+    if cfg.save_sharded:
+        cmd.append("--save_sharded")
     return cmd
 
 

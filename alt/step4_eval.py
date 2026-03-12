@@ -17,14 +17,24 @@ Outputs:
   - console metrics
   - optional JSON summary
 
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=1,3 \
 python step4_eval.py \
   --model_name meta-llama/Llama-3.1-8B \
-  --wdq_star_path ./output/llama3_8b/step3_alt/wdq_star_best.pt \
-  --low_rank_ab_path ./output/llama3_8b/step3_alt/low_rank_ab_best.pt \
+  --wdq_star_path ./output/llama3_8b/step3_alt/3bit/wdq_star_best.pt \
+  --low_rank_ab_path ./output/llama3_8b/step3_alt/3bit/low_rank_ab_best.pt \
+  --device_map auto \
+  --num_gpus 2 \
   --device cuda:0 \
   --compare_wdq_only
 
+CUDA_VISIBLE_DEVICES=2 \
+python step4_eval.py \
+  --model_name meta-llama/Llama-3.1-8B \
+  --wdq_star_path ./output/llama3_8b/step3_5_three_stage/2bit/wdq_star.pt \
+  --low_rank_ab_path ./output/llama3_8b/step3_5_three_stage/2bit/low_rank_ab.pt \
+  --device_map auto \
+  --device cuda:0 \
+  --compare_wdq_only
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ import argparse
 import gc
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -54,6 +65,68 @@ from step4_eval import (  # type: ignore  # noqa: E402
 )
 
 
+def torch_load_cpu(path: Path, *, mmap: bool = False):
+    load_kwargs = {"map_location": "cpu"}
+    if mmap:
+        load_kwargs["mmap"] = True
+    try:
+        return torch.load(path, **load_kwargs)
+    except TypeError:
+        if not mmap:
+            raise
+    except RuntimeError:
+        if not mmap:
+            raise
+    return torch.load(path, map_location="cpu")
+
+
+class ShardedArtifactDict(Mapping[str, Any]):
+    def __init__(self, root: Path, *, mmap: bool = False):
+        self.root = root
+        self.mmap = bool(mmap)
+        manifest_path = root / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"sharded artifact manifest not found: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entries = manifest.get("entries", [])
+        self._entries = [(str(item["key"]), str(item["file"])) for item in entries]
+        self._index = {key: rel for key, rel in self._entries}
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._index:
+            raise KeyError(key)
+        obj = torch_load_cpu(self.root / self._index[key], mmap=self.mmap)
+        if isinstance(obj, dict) and len(obj) == 1 and key in obj:
+            return obj[key]
+        return obj
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def items(self):
+        for key, _ in self._entries:
+            yield key, self[key]
+
+
+def _resolve_artifact_path(base: Path, stem: str) -> Optional[Path]:
+    file_path = base / f"{stem}.pt"
+    if file_path.exists():
+        return file_path
+    dir_path = base / stem
+    if dir_path.exists():
+        return dir_path
+    return None
+
+
+def _load_artifact(path: Path, *, mmap: bool):
+    if path.is_dir():
+        return ShardedArtifactDict(path, mmap=mmap)
+    return torch_load_cpu(path, mmap=mmap)
+
+
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser("Alt Step4 Eval - Wdq* and AB* evaluation")
     ap.add_argument("--model_name", required=True)
@@ -62,8 +135,28 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--wdq_star_path", default=None, help="Explicit wdq_star(.pt) path")
     ap.add_argument("--low_rank_ab_path", default=None, help="Explicit low_rank_ab(.pt) path")
     ap.add_argument("--calib_s_path", default=None, help="Optional calib_s for uv-ab style artifacts")
+    ap.add_argument("--artifact_mmap", dest="artifact_mmap", action="store_true")
+    ap.add_argument("--no_artifact_mmap", dest="artifact_mmap", action="store_false")
 
     ap.add_argument("--device", default=("cuda:0" if torch.cuda.is_available() else "cpu"))
+    ap.add_argument(
+        "--device_map",
+        default=("auto" if torch.cuda.device_count() > 1 else "none"),
+        help='Model load placement: e.g. "auto" or "none"',
+    )
+    ap.add_argument("--num_gpus", type=int, default=0, help="device_map=auto일 때 사용할 최대 GPU 개수 (0이면 visible 전부)")
+    ap.add_argument(
+        "--first_gpu_reserve_gib",
+        type=int,
+        default=6,
+        help="device_map=auto일 때 첫 번째 visible GPU에 남겨둘 GiB 수",
+    )
+    ap.add_argument(
+        "--other_gpu_reserve_gib",
+        type=int,
+        default=4,
+        help="device_map=auto일 때 나머지 GPU에 남겨둘 GiB 수",
+    )
     ap.add_argument("--model_dtype", default="fp16", choices=["fp16", "bf16", "fp32"])
     ap.add_argument("--trust_remote_code", action="store_true")
     ap.add_argument("--ab_compute", default="fp16", choices=["fp16", "fp32"])
@@ -79,6 +172,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--gen_temperature", type=float, default=1.0)
     ap.add_argument("--gen_top_p", type=float, default=1.0)
     ap.add_argument("--save_json", default=None)
+    ap.set_defaults(artifact_mmap=True)
     return ap.parse_args()
 
 
@@ -105,20 +199,20 @@ def _resolve_step3_artifacts(
     step3_dir: Path,
     use_best: bool,
 ) -> Tuple[Path, Optional[Path]]:
-    wdq_name = "wdq_star_best.pt" if use_best else "wdq_star.pt"
-    ab_name = "low_rank_ab_best.pt" if use_best else "low_rank_ab.pt"
+    wdq_stem = "wdq_star_best" if use_best else "wdq_star"
+    ab_stem = "low_rank_ab_best" if use_best else "low_rank_ab"
 
-    wdq_path = step3_dir / wdq_name
-    ab_path = step3_dir / ab_name
+    wdq_path = _resolve_artifact_path(step3_dir, wdq_stem)
+    ab_path = _resolve_artifact_path(step3_dir, ab_stem)
 
-    if not wdq_path.exists() and use_best:
-        wdq_path = step3_dir / "wdq_star.pt"
-    if not ab_path.exists() and use_best:
-        ab_path = step3_dir / "low_rank_ab.pt"
+    if wdq_path is None and use_best:
+        wdq_path = _resolve_artifact_path(step3_dir, "wdq_star")
+    if ab_path is None and use_best:
+        ab_path = _resolve_artifact_path(step3_dir, "low_rank_ab")
 
-    if not wdq_path.exists():
+    if wdq_path is None:
         raise FileNotFoundError(f"wdq artifact not found under {step3_dir}")
-    if not ab_path.exists():
+    if ab_path is None:
         ab_path = None
     return wdq_path, ab_path
 
@@ -126,6 +220,10 @@ def _resolve_step3_artifacts(
 def _load_model_and_tokenizer(
     model_name: str,
     device: torch.device,
+    device_map: Optional[str],
+    num_gpus: int,
+    first_gpu_reserve_gib: int,
+    other_gpu_reserve_gib: int,
     torch_dtype: torch.dtype,
     trust_remote_code: bool,
 ):
@@ -134,16 +232,80 @@ def _load_model_and_tokenizer(
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    print(f"📥 Loading base model: {model_name} (dtype={torch_dtype}, device={device})")
+    print(f"📥 Loading base model: {model_name} (dtype={torch_dtype}, device={device}, device_map={device_map})")
+    model_kwargs: Dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": trust_remote_code,
+        "low_cpu_mem_usage": True,
+    }
+    if device_map is None:
+        model_kwargs["device_map"] = "cpu"
+    else:
+        model_kwargs["device_map"] = device_map
+
+    if device_map == "auto" and torch.cuda.is_available():
+        visible = torch.cuda.device_count()
+        use_n = visible if int(num_gpus) <= 0 else min(int(num_gpus), int(visible))
+        if use_n > 0:
+            max_memory = {}
+            for idx in range(use_n):
+                total_gib = int(torch.cuda.get_device_properties(idx).total_memory // (1024 ** 3))
+                reserve_gib = int(first_gpu_reserve_gib) if idx == 0 else int(other_gpu_reserve_gib)
+                max_memory[idx] = f"{max(1, total_gib - reserve_gib)}GiB"
+            max_memory["cpu"] = "512GiB"
+            model_kwargs["max_memory"] = max_memory
+            print(f"[Eval] auto device_map GPU limit: {use_n} (indices: {list(range(use_n))})")
+            print(f"[Eval] max_memory: {max_memory}")
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch_dtype,
-        device_map="cpu",
-        trust_remote_code=trust_remote_code,
+        **model_kwargs,
     )
     model.eval()
-    model = model.to(device)
+    if device_map is None:
+        model = model.to(device)
     return model, tok
+
+
+def _normalize_device(device_like: Any) -> Optional[torch.device]:
+    if isinstance(device_like, torch.device):
+        return device_like
+    if isinstance(device_like, int):
+        return torch.device(f"cuda:{device_like}")
+    if isinstance(device_like, str):
+        text = device_like.strip()
+        if text == "":
+            return None
+        if text.isdigit():
+            return torch.device(f"cuda:{text}")
+        if text in {"cpu", "mps"} or text.startswith("cuda:") or text == "cuda":
+            return torch.device(text)
+    return None
+
+
+def _infer_eval_device(model: torch.nn.Module, fallback: torch.device) -> torch.device:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_device_map, dict) and hf_device_map:
+        preferred_keys = (
+            "model.embed_tokens",
+            "model.decoder.embed_tokens",
+            "transformer.wte",
+            "transformer.word_embeddings",
+            "gpt_neox.embed_in",
+        )
+        for key in preferred_keys:
+            if key in hf_device_map:
+                dev = _normalize_device(hf_device_map[key])
+                if dev is not None:
+                    return dev
+        for _, value in hf_device_map.items():
+            dev = _normalize_device(value)
+            if dev is not None:
+                return dev
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return fallback
 
 
 def main() -> None:
@@ -170,28 +332,31 @@ def main() -> None:
     if ab_path is not None and not ab_path.exists():
         raise FileNotFoundError(f"low_rank_ab path not found: {ab_path}")
 
-    device = torch.device(args.device)
+    requested_device = torch.device(args.device)
+    dm_raw = str(args.device_map).strip().lower()
+    resolved_device_map = None if dm_raw in {"", "none", "null"} else args.device_map
     model_dtype = _torch_dtype_from_name(args.model_dtype)
 
     print("== alt step4 eval ==")
     print(f"model_name : {args.model_name}")
-    print(f"device     : {device}")
+    print(f"device     : {requested_device}")
+    print(f"device_map : {resolved_device_map}")
     print(f"wdq_path   : {wdq_path}")
     print(f"ab_path    : {ab_path}")
 
     print(f"📦 Loading Wdq*: {wdq_path}")
-    wdq_star: Dict[str, torch.Tensor] = torch.load(wdq_path, map_location="cpu")
+    wdq_star = _load_artifact(wdq_path, mmap=bool(args.artifact_mmap))
 
-    low_rank_ab: Optional[Dict[str, Any]] = None
+    low_rank_ab: Optional[Mapping[str, Any]] = None
     calib_s = None
     if ab_path is not None:
         print(f"📦 Loading AB*: {ab_path}")
-        low_rank_ab = torch.load(ab_path, map_location="cpu")
+        low_rank_ab = _load_artifact(ab_path, mmap=bool(args.artifact_mmap))
 
     if args.calib_s_path is not None:
         calib_path = Path(args.calib_s_path).resolve()
         print(f"📦 Loading calib_s: {calib_path}")
-        calib_s = torch.load(calib_path, map_location="cpu")
+        calib_s = torch_load_cpu(calib_path, mmap=bool(args.artifact_mmap))
 
     if low_rank_ab is not None:
         has_uvab = any(
@@ -209,7 +374,8 @@ def main() -> None:
         "model_name": args.model_name,
         "wdq_star_path": str(wdq_path),
         "low_rank_ab_path": (str(ab_path) if ab_path is not None else None),
-        "device": str(device),
+        "device": str(requested_device),
+        "device_map": resolved_device_map,
         "model_dtype": args.model_dtype,
         "ab_compute": args.ab_compute,
         "ab_alpha": float(args.ab_alpha),
@@ -224,10 +390,17 @@ def main() -> None:
     try:
         model, tok = _load_model_and_tokenizer(
             model_name=args.model_name,
-            device=device,
+            device=requested_device,
+            device_map=resolved_device_map,
+            num_gpus=int(args.num_gpus),
+            first_gpu_reserve_gib=int(args.first_gpu_reserve_gib),
+            other_gpu_reserve_gib=int(args.other_gpu_reserve_gib),
             torch_dtype=model_dtype,
             trust_remote_code=bool(args.trust_remote_code),
         )
+        eval_device = _infer_eval_device(model, requested_device)
+        print(f"[Eval] input/eval device: {eval_device}")
+        results["eval_device"] = str(eval_device)
 
         apply_wdq_star(model, wdq_star)
 
@@ -236,7 +409,7 @@ def main() -> None:
             ppl_wdq, ppl_wdq_sec = evaluate_ppl_wikitext2(
                 model,
                 tok,
-                device,
+                eval_device,
                 label="Wdq*",
                 stride=int(args.ppl_stride),
                 max_tokens=int(args.ppl_max_tokens),
@@ -262,7 +435,7 @@ def main() -> None:
             ppl_ab, ppl_ab_sec = evaluate_ppl_wikitext2(
                 model,
                 tok,
-                device,
+                eval_device,
                 label=f"Wdq*+AB* (a={args.ab_alpha:g})",
                 stride=int(args.ppl_stride),
                 max_tokens=int(args.ppl_max_tokens),
@@ -283,7 +456,7 @@ def main() -> None:
             gen_stats = measure_generation_metrics(
                 model,
                 tok,
-                device,
+                eval_device,
                 prompts=prompts,
                 max_new_tokens=int(args.gen_max_new_tokens),
                 do_sample=bool(args.gen_do_sample),

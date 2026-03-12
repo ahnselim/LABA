@@ -17,13 +17,13 @@ Mixture step0 module: Step0-1 quantization (Lloyd-Max asym non-uniform baseline)
 참고:
   - `LABA/mixture/step0_optimization.py`와의 호환을 위해 래퍼 API를 함께 제공한다.
 
-CUDA_VISIBLE_DEVICES=2 \
+CUDA_VISIBLE_DEVICES=2 nohup \
 python step_1_quantize.py \
   --model_id meta-llama/Llama-3.1-8B \
-  --bits 3 \
+  --bits 4 \
   --group_size 128 \
   --calib_s_path ./output/llama3_8b/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_8b/step1_quant/4bit
+  --out_dir ./output/llama3_8b/step1_quant/4bit > quant_4bit.log 2>&1 &
   
 """
 
@@ -157,6 +157,42 @@ def _kth_quantiles_lastdim(X_flat: torch.Tensor, probs: torch.Tensor) -> torch.T
 
 
 @torch.no_grad()
+def _lloyd_centroid_update(
+    x: torch.Tensor,
+    idx: torch.Tensor,
+    levels: int,
+    prev_cb: torch.Tensor,
+    sample_weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    new_cb = prev_cb.clone()
+    numer = torch.zeros_like(new_cb)
+    numer.scatter_add_(1, idx, x)
+    count = torch.zeros_like(new_cb)
+    count.scatter_add_(1, idx, torch.ones_like(x))
+    assigned = count > 0
+
+    if sample_weight is None:
+        mean = numer / count.clamp_min(1.0)
+        return torch.where(assigned, mean, new_cb)
+
+    weighted_numer = torch.zeros_like(new_cb)
+    weighted_numer.scatter_add_(1, idx, x * sample_weight)
+    weighted_denom = torch.zeros_like(new_cb)
+    weighted_denom.scatter_add_(1, idx, sample_weight)
+
+    weighted_valid = weighted_denom > 0
+    if weighted_valid.any():
+        weighted_mean = weighted_numer / weighted_denom.clamp_min(1e-12)
+        new_cb = torch.where(weighted_valid, weighted_mean, new_cb)
+
+    fallback = assigned & (~weighted_valid)
+    if fallback.any():
+        plain_mean = numer / count.clamp_min(1.0)
+        new_cb = torch.where(fallback, plain_mean, new_cb)
+    return new_cb
+
+
+@torch.no_grad()
 def _lloyd_max_codebook_per_group(
     X_flat: torch.Tensor,         # [N,S], N=O*G
     levels: int,                  # L = 2^b
@@ -211,30 +247,7 @@ def _lloyd_max_codebook_per_group(
         for _ in range(max(1, int(max_iter))):
             mid = (cb[:, :-1] + cb[:, 1:]) * 0.5       # [n,L-1]
             idx = torch.sum(x.unsqueeze(-1) > mid.unsqueeze(1), dim=-1).to(torch.long)  # [n,S]
-
-            new_cb = cb.clone()
-            for k in range(levels):
-                mask = idx == k
-                valid = mask.any(dim=1)
-                if valid.any():
-                    if w is None:
-                        cnt = mask.sum(dim=1)
-                        numer = (x * mask.to(x.dtype)).sum(dim=1)
-                        new_cb[valid, k] = numer[valid] / cnt[valid].to(x.dtype)
-                    else:
-                        mask_f = mask.to(x.dtype)
-                        weighted_mask = w * mask_f
-                        denom = weighted_mask.sum(dim=1)
-                        numer = (x * weighted_mask).sum(dim=1)
-                        valid_w = denom > 0
-                        if valid_w.any():
-                            new_cb[valid_w, k] = numer[valid_w] / denom[valid_w].clamp_min(1e-12)
-                        empty_w = valid & (~valid_w)
-                        if empty_w.any():
-                            cnt = mask.sum(dim=1)
-                            numer = (x * mask_f).sum(dim=1)
-                            new_cb[empty_w, k] = numer[empty_w] / cnt[empty_w].to(x.dtype)
-
+            new_cb = _lloyd_centroid_update(x, idx, levels, cb, sample_weight=w)
             new_cb, _ = torch.sort(new_cb, dim=1)
             delta = (new_cb - cb).abs().amax()
             cb = new_cb
@@ -290,8 +303,7 @@ def _dequant_from_codebook_and_codes(
     """
     if codes.dtype != torch.long:
         codes = codes.to(torch.long)
-    rows = torch.arange(codebook.shape[0], device=codebook.device).unsqueeze(1)  # [N,1]
-    return codebook[rows, codes]  # [N,S]
+    return torch.gather(codebook, dim=1, index=codes)
 
 
 @torch.no_grad()
