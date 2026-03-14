@@ -10,17 +10,17 @@ step2_1 artifacts into step2_2 automatically.
 기본값으로 init seed(`init_assign_csv`)를 `cvx/step1_3c_opt.py`로 자동 생성한다.
 
 기본 사용 (step2_1 + step2_2 연속 실행):
-CUDA_VISIBLE_DEVICES=2 nohup python step2_greedy_mc.py \
-  --model_id huggyllama/llama-7b \
-  --sens_csv ./output_7b/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
-  --alpha_csv ./output_7b/output_step1_cvx/step1_2/alpha_layerwise_prebake.csv \
-  --prebake_root ./output_7b/output_step0_prebake \
-  --target_avg_bits 2.5 \
-  --out_root ./output_7b/output_step2_mc_greedy \
+CUDA_VISIBLE_DEVICES=1 nohup python step2_greedy_mc.py \
+  --model_id meta-llama/Llama-3.1-8B \
+  --sens_csv ./output/llama3_8b/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
+  --alpha_csv ./output/llama3_8b/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \
+  --prebake_root ./output/llama3_8b/output_step0_prebake_alt \
+  --target_avg_bits 2.25 \
+  --out_root ./output/llama3_8b/output_step2_mc_greedy/2_25bit \
   --gpu_id 0 \
   --use_round_band \
-  --warmup_bits_lo 2.5 --warmup_bits_hi 3.0 \
-  --round_quantum 0.1 > ./logs/step2_mc.log 2>&1 &
+  --warmup_bits_lo 2.0 --warmup_bits_hi 2.5 \
+  --round_quantum 0.01 > ./logs/step2_mc_llama3_8b_225.log 2>&1 &
 
 Warmup(step2_1) 재사용하고 step2_2만 실행 : 
 CUDA_VISIBLE_DEVICES=0 python LABA/mixture/step2_greedy_mc.py \

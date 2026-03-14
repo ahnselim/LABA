@@ -13,12 +13,19 @@ Output layout:
     summaries/bit{b}.json
 
 Example:
-  python LABA/alt/utils/prebake_from_alternating.py \
-    --out_root ./output_step0_prebake_alt \
-    --step3 1=./output/step3_alt/1bit \
-    --step3 2=./output/step3_alt/2bit \
-    --step3 3=./output/step3_alt/3bit \
-    --step3 4=./output/step3_alt/4bit
+CUDA_VISIBLE_DEVICES=1 \
+  python utils/prebake_from_alternating.py \
+    --out_root ./output/llama3_8b/output_step0_prebake_alt \
+    --step3 1=./output/llama3_8b/step3_alt/1bit_50 \
+    --step3 2=./output/llama3_8b/step3_alt/2bit_50 \
+    --step3 3=./output/llama3_8b/step3_alt/3bit_50 \
+    --step3 4=./output/llama3_8b/step3_alt/4bit_50 
+    
+CUDA_VISIBLE_DEVICES=1 \
+  python utils/prebake_from_alternating.py \
+    --out_root ./output/llama3_8b/output_step0_prebake_alt \
+    --step3 4=./output/llama3_8b/step3_alt/4bit_50 
+        
 """
 
 from __future__ import annotations
@@ -34,6 +41,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+
+WDQ_ARTIFACT = "wdq_star.pt"
+AB_ARTIFACT = "low_rank_ab.pt"
 
 
 def _safe_name(s: object) -> str:
@@ -79,15 +89,6 @@ def _canonical_bits(bits: Iterable[int]) -> List[int]:
             seen.add(b)
             out.append(b)
     return out
-
-
-def _pick_artifact_names(which: str) -> Tuple[str, str]:
-    which_norm = str(which).strip().lower()
-    if which_norm == "best":
-        return "wdq_star_best.pt", "low_rank_ab_best.pt"
-    if which_norm == "final":
-        return "wdq_star.pt", "low_rank_ab.pt"
-    raise ValueError(f"which must be one of ['best', 'final'], got {which}")
 
 
 def _infer_bit_from_summary(summary: Optional[dict]) -> Optional[int]:
@@ -150,10 +151,10 @@ def _resolve_bit(
     )
 
 
-def _maybe_copy_raw(which: str, bit: int, wdq_path: Path, ab_path: Path, out_root: Path, enabled: bool) -> dict:
+def _maybe_copy_raw(bit: int, wdq_path: Path, ab_path: Path, out_root: Path, enabled: bool) -> dict:
     if not enabled:
         return {}
-    raw_root = out_root / ("best_raw" if which == "best" else "raw") / f"bit{bit}"
+    raw_root = out_root / "raw" / f"bit{bit}"
     raw_root.mkdir(parents=True, exist_ok=True)
     wdq_dst = raw_root / wdq_path.name
     ab_dst = raw_root / ab_path.name
@@ -175,7 +176,6 @@ class ExportSpec:
 class ExportConfig:
     out_root: str
     step3_specs: Tuple[ExportSpec, ...]
-    which: str = "best"
     copy_raw: bool = False
 
 
@@ -190,19 +190,24 @@ def parse_step3_spec(spec: str) -> ExportSpec:
     return ExportSpec(bit=bit, step3_dir=Path(right.strip()).resolve())
 
 
+def _flatten_step3_args(step3_args: Sequence[Sequence[str]]) -> Tuple[ExportSpec, ...]:
+    specs: List[ExportSpec] = []
+    for group in step3_args:
+        for item in group:
+            specs.append(parse_step3_spec(item))
+    return tuple(specs)
+
+
 @torch.no_grad()
 def export_prebake_from_alternating(
     *,
     step3_dir: Path,
     out_root: Path,
-    which: str = "best",
     explicit_bit: Optional[int] = None,
     copy_raw: bool = False,
 ) -> dict:
-    which = str(which).strip().lower()
-    wdq_name, ab_name = _pick_artifact_names(which)
-    wdq_path = step3_dir / wdq_name
-    ab_path = step3_dir / ab_name
+    wdq_path = step3_dir / WDQ_ARTIFACT
+    ab_path = step3_dir / AB_ARTIFACT
     quant_meta_path = step3_dir / "quant_meta_star.pt"
     summary_path = step3_dir / "summary.json"
 
@@ -263,7 +268,7 @@ def export_prebake_from_alternating(
             merged_meta.update(qmeta)
         if isinstance(rec_meta, dict):
             merged_meta.update(rec_meta)
-        merged_meta["which"] = which
+        merged_meta["which"] = "final"
         merged_meta["step3_dir"] = str(step3_dir)
 
         qmode = str(merged_meta.get("qtype", "alternating"))
@@ -281,7 +286,7 @@ def export_prebake_from_alternating(
             "meta": {
                 "bit": int(bit),
                 "variant": "alt-step3-alternating",
-                "source": f"step_3_alternating:{which}",
+                "source": "step_3_alternating:final",
                 "qmode": qmode,
                 "group_size": (None if group_size is None else int(group_size)),
                 "step3_meta": merged_meta,
@@ -290,7 +295,7 @@ def export_prebake_from_alternating(
         torch.save(payload, bit_dir / f"{_safe_name(module)}.pt")
         saved += 1
 
-    raw_paths = _maybe_copy_raw(which, bit, wdq_path, ab_path, out_root, copy_raw)
+    raw_paths = _maybe_copy_raw(bit, wdq_path, ab_path, out_root, copy_raw)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -298,7 +303,6 @@ def export_prebake_from_alternating(
     result = {
         "bit": int(bit),
         "step3_dir": str(step3_dir),
-        "which": which,
         "wdq_path": str(wdq_path),
         "ab_path": str(ab_path),
         "quant_meta_path": (str(quant_meta_path) if quant_meta_path.exists() else None),
@@ -345,7 +349,6 @@ def run(cfg: ExportConfig) -> Dict[str, str]:
         result = export_prebake_from_alternating(
             step3_dir=spec.step3_dir,
             out_root=out_root,
-            which=cfg.which,
             explicit_bit=spec.bit,
             copy_raw=bool(cfg.copy_raw),
         )
@@ -363,10 +366,13 @@ def run(cfg: ExportConfig) -> Dict[str, str]:
         "revision": revision,
         "bits": exported_bits,
         "created": int(time.time()),
-        "which": str(cfg.which).strip().lower(),
         "copy_raw": bool(cfg.copy_raw),
+        "artifacts": {
+            "wdq": WDQ_ARTIFACT,
+            "ab": AB_ARTIFACT,
+        },
         "bit_to_step3_dir": step3_mapping,
-        "note": "LABA/alt/step_3_alternating outputs exported in step0 prebake-compatible per-module format.",
+        "note": "LABA/alt/step_3_alternating wdq_star/low_rank_ab outputs exported in step0 prebake-compatible per-module format.",
     }
     _write_json(out_root / "meta.json", meta)
 
@@ -391,15 +397,14 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> ExportConfig:
         "--step3",
         required=True,
         nargs="+",
+        action="append",
         help="Repeatable items in the form BIT=/path/to/step3_out or /path/to/step3_out.",
     )
-    ap.add_argument("--which", default="best", choices=["best", "final"])
     ap.add_argument("--copy_raw", action="store_true")
     ns = ap.parse_args(argv)
     return ExportConfig(
         out_root=str(ns.out_root),
-        step3_specs=tuple(parse_step3_spec(item) for item in ns.step3),
-        which=str(ns.which),
+        step3_specs=_flatten_step3_args(ns.step3),
         copy_raw=bool(ns.copy_raw),
     )
 

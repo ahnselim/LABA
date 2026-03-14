@@ -21,17 +21,17 @@ unset TRANSFORMERS_CACHE
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-CUDA_VISIBLE_DEVICES=2,1,0 nohup \
+CUDA_VISIBLE_DEVICES=1 nohup \
 python step1_greedy_optimization.py \
-  --model_id mistralai/Mistral-7B-v0.3 \
-  --step0_out_root ./mistral_7b/output_step0_prebake \
-  --out_root ./mistral_7b/output_step1_greedy \
+  --model_id meta-llama/Llama-3.1-8B \
+  --step0_out_root ./output/llama3_8b/output_step0_prebake_alt \
+  --out_root ./output/llama3_8b/output_step1_greedy \
   --alpha_reuse_calib \
   --bitopt_mode budget \
   --avg_bits 2.25 \
   --sens_device_map auto \
   --alpha_device_map auto \
-  --trust_remote_code > ./logs/mistral_7b_step1.log 2>&1 &
+  --trust_remote_code > ./logs/llama3_8b_step1.log 2>&1 &
 
 """
 
