@@ -125,8 +125,120 @@ class AddLowRankCorrectionFP32(nn.Module):
         return (z.to(torch.float32) + corr * self.alpha).to(x.dtype)
 
 
+def _sparse_mm_from_coo(
+    x: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    sparse_values: torch.Tensor,
+    sparse_shape: Tuple[int, int],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    x_flat = x.reshape(-1, x.shape[-1])
+    sp = torch.sparse_coo_tensor(
+        sparse_indices,
+        sparse_values,
+        size=sparse_shape,
+        device=x_flat.device,
+    ).coalesce()
+    corr_t = torch.sparse.mm(sp.to(torch.float32), x_flat.to(torch.float32).transpose(0, 1))
+    corr = corr_t.transpose(0, 1).reshape(*x.shape[:-1], sparse_shape[0])
+    return corr.to(out_dtype)
+
+
+class AddSparseAndLowRankCorrection(nn.Module):
+    def __init__(
+        self,
+        inner: nn.Module,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        sparse_indices: Optional[torch.Tensor] = None,
+        sparse_values: Optional[torch.Tensor] = None,
+        sparse_shape: Optional[Tuple[int, int]] = None,
+        alpha: float = 1.0,
+    ):
+        super().__init__()
+        self.inner = inner
+        self.register_buffer("A", A.to(torch.float16), persistent=False)
+        self.register_buffer("B", B.to(torch.float16), persistent=False)
+        self.alpha = float(alpha)
+        if sparse_indices is not None and sparse_values is not None and sparse_shape is not None:
+            self.register_buffer("sparse_indices", sparse_indices.to(torch.long), persistent=False)
+            self.register_buffer("sparse_values", sparse_values.to(torch.float16), persistent=False)
+            self.sparse_shape = tuple(int(x) for x in sparse_shape)
+        else:
+            self.sparse_indices = None
+            self.sparse_values = None
+            self.sparse_shape = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.inner(x)
+        if self.alpha == 0.0:
+            return z
+        r = F.linear(x, self.B)
+        corr = F.linear(r, self.A)
+        if self.sparse_indices is not None and self.sparse_values is not None and self.sparse_shape is not None:
+            corr = corr + _sparse_mm_from_coo(
+                x=x,
+                sparse_indices=self.sparse_indices,
+                sparse_values=self.sparse_values,
+                sparse_shape=self.sparse_shape,
+                out_dtype=corr.dtype,
+            )
+        return z.add_(corr, alpha=self.alpha)
+
+
+class AddSparseAndLowRankCorrectionFP32(nn.Module):
+    def __init__(
+        self,
+        inner: nn.Module,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        sparse_indices: Optional[torch.Tensor] = None,
+        sparse_values: Optional[torch.Tensor] = None,
+        sparse_shape: Optional[Tuple[int, int]] = None,
+        alpha: float = 1.0,
+    ):
+        super().__init__()
+        self.inner = inner
+        self.register_buffer("A", A.to(torch.float16), persistent=False)
+        self.register_buffer("B", B.to(torch.float16), persistent=False)
+        self.alpha = float(alpha)
+        if sparse_indices is not None and sparse_values is not None and sparse_shape is not None:
+            self.register_buffer("sparse_indices", sparse_indices.to(torch.long), persistent=False)
+            self.register_buffer("sparse_values", sparse_values.to(torch.float16), persistent=False)
+            self.sparse_shape = tuple(int(x) for x in sparse_shape)
+        else:
+            self.sparse_indices = None
+            self.sparse_values = None
+            self.sparse_shape = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.inner(x)
+        if self.alpha == 0.0:
+            return z
+        x32 = x.to(torch.float32)
+        r = F.linear(x32, self.B.to(torch.float32))
+        corr = F.linear(r, self.A.to(torch.float32))
+        if self.sparse_indices is not None and self.sparse_values is not None and self.sparse_shape is not None:
+            corr = corr + _sparse_mm_from_coo(
+                x=x32,
+                sparse_indices=self.sparse_indices,
+                sparse_values=self.sparse_values,
+                sparse_shape=self.sparse_shape,
+                out_dtype=torch.float32,
+            )
+        return (z.to(torch.float32) + corr * self.alpha).to(x.dtype)
+
+
 def _unwrap_base_linear(module: nn.Module) -> nn.Module:
-    while isinstance(module, (AddLowRankCorrection, AddLowRankCorrectionFP32)):
+    while isinstance(
+        module,
+        (
+            AddLowRankCorrection,
+            AddLowRankCorrectionFP32,
+            AddSparseAndLowRankCorrection,
+            AddSparseAndLowRankCorrectionFP32,
+        ),
+    ):
         module = module.inner
     return module
 
@@ -222,11 +334,18 @@ def patch_layerwise_ab_from_step2p5(
 
         A = None
         B = None
+        sparse_indices = None
+        sparse_values = None
+        sparse_shape = None
 
         if low_rank_ab is not None and wkey in low_rank_ab:
             item = low_rank_ab[wkey]
             if isinstance(item, dict) and ("A" in item) and ("B" in item):
                 A, B = item["A"], item["B"]
+                if "sparse_indices" in item and "sparse_values" in item and "sparse_shape" in item:
+                    sparse_indices = item["sparse_indices"]
+                    sparse_values = item["sparse_values"]
+                    sparse_shape = tuple(int(v) for v in item["sparse_shape"])
                 # Step3 uv-ab format:
                 #   Rw ~= diag(u) (A B) diag(v),   Rw = (W-Wdq) * s
                 # so correction in weight domain is:
@@ -325,13 +444,34 @@ def patch_layerwise_ab_from_step2p5(
             skipped += 1
             continue
 
-        wrapper_cls = AddLowRankCorrectionFP32 if (ab_compute == "fp32") else AddLowRankCorrection
-        wrapped = wrapper_cls(
-            inner,
-            A.to(device=inner.weight.device),
-            B.to(device=inner.weight.device),
-            alpha=alpha,
+        has_sparse = (
+            sparse_indices is not None
+            and sparse_values is not None
+            and sparse_shape is not None
         )
+        if has_sparse and tuple(sparse_shape) != (int(O), int(I)):
+            skipped += 1
+            continue
+
+        if has_sparse:
+            wrapper_cls = AddSparseAndLowRankCorrectionFP32 if (ab_compute == "fp32") else AddSparseAndLowRankCorrection
+            wrapped = wrapper_cls(
+                inner,
+                A.to(device=inner.weight.device),
+                B.to(device=inner.weight.device),
+                sparse_indices=sparse_indices.to(device=inner.weight.device),
+                sparse_values=sparse_values.to(device=inner.weight.device),
+                sparse_shape=sparse_shape,
+                alpha=alpha,
+            )
+        else:
+            wrapper_cls = AddLowRankCorrectionFP32 if (ab_compute == "fp32") else AddLowRankCorrection
+            wrapped = wrapper_cls(
+                inner,
+                A.to(device=inner.weight.device),
+                B.to(device=inner.weight.device),
+                alpha=alpha,
+            )
         setattr(parent, attr, wrapped)
         patched += 1
 

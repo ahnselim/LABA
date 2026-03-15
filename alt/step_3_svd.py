@@ -1,45 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Alternative Step3: LABA-style alternating Lloyd-Max + layerwise low-rank compensation.
+Alt Step3 SVD - build eval-ready `wdq_star` and dense low-rank AB from Step1/Step2 artifacts.
 
-Algorithm:
-  1) Initialize Wq^(0) with Lloyd-Max quantization.
-  2) Fit weighted rank-r low-rank factors on residual (W - Wq) D.
-  3) Alternate:
-       - AB update:  min || (W - Wq - AB) D ||_F^2
-       - Wq update:  min_{Wq in Q} || (W - AB - Wq) D ||_F^2
+What this script does:
+  1. Load Step1 quantization artifacts (`codebook.pt`, `qcodes.pt`, `meta.pt`)
+  2. Reconstruct Step1 quantized weight `Wq` for each target layer
+  3. Load Step2 calibration sqrt-diag stats `s`
+  4. Fit rank-r SVD on the diag-weighted residual `(W - Wq) * s`
+  5. Save:
+       - `wdq_star.pt`
+       - `low_rank_ab.pt`
+     so `step4_eval.py` can evaluate them directly
 
-Outputs:
-  - out_dir/wdq_star.pt
-  - out_dir/low_rank_ab.pt
-  - out_dir/wdq_star_best.pt
-  - out_dir/low_rank_ab_best.pt
-  - out_dir/codebook_star.pt
-  - out_dir/qcodes_star.pt
-  - out_dir/quant_meta_star.pt
-  - out_dir/metrics.jsonl
-  - out_dir/summary.json
- 
-CUDA_VISIBLE_DEVICES=2 nohup \
-python step_3_alternating.py \
-  --model_id Qwen/Qwen3-8B \
-  --step1_dir ./output/qwen3_8b/step1_quant/4bit \
-  --calib_s ./output/qwen3_8b/calib_sqrtdiag.pt \
-  --out_dir ./output/qwen3_8b/step3_alt/4bit_50 \
-  --qtype hessian-aware \
-  --rank_ab 64 \
-  --outer_loops 50 > ./logs/qwen3_8b_4bit_50.log 2>&1 &
-  
-CUDA_VISIBLE_DEVICES=3 nohup \
-python step_3_alternating.py \
+Usage:
+CUDA_VISIBLE_DEVICES=2 nohup python step_3_svd.py \
   --model_id meta-llama/Llama-3.1-8B \
   --step1_dir ./output/llama3_8b_64/step1_quant/1bit \
   --calib_s ./output/llama3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_8b_64/step3_alt/1bit \
-  --qtype hessian-aware \
+  --out_dir ./output/llama3_8b_64/step3_svd/1bit \
   --rank_ab 64 \
-  --outer_loops 10 > ./logs/llama3_8b_1bit_10.log 2>&1 &
+  --device cuda \
+  --model_device_map auto > ./logs/llama3_8b_1bit_svd.log 2>&1 &
 
 """
 
@@ -48,8 +30,6 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
-import random
 import re
 import subprocess
 import sys
@@ -69,11 +49,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-from step_1_quantize import (  # noqa: E402
-    _snapshot_state_to_cpu,
-    is_target_weight,
-    lloyd_asym_nonuniform_quantize,
-)
+from step_1_quantize import _snapshot_state_to_cpu, is_target_weight  # noqa: E402
 
 
 MODULE_ORDER = {
@@ -88,12 +64,6 @@ MODULE_ORDER = {
     "fc1": 8,
     "fc2": 9,
 }
-
-
-def set_seed(seed: int) -> None:
-    random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    torch.cuda.manual_seed_all(int(seed))
 
 
 def extract_block_index(name: str) -> Optional[int]:
@@ -132,8 +102,10 @@ def dequant_from_codebook_codes(
 def rank_r_svd(m: torch.Tensor, r: int) -> Tuple[torch.Tensor, torch.Tensor]:
     o, i = m.shape
     r_eff = min(int(r), o, i)
-    if r_eff <= 0:
-        raise ValueError("rank must be positive")
+    if r_eff < 0:
+        raise ValueError("rank must be non-negative")
+    if r_eff == 0:
+        return m.new_zeros((o, 0)), m.new_zeros((0, i))
     try:
         u, s, v = torch.linalg.svd_lowrank(m, q=r_eff, niter=2)
         sroot = torch.sqrt(s.clamp_min(0.0))
@@ -193,19 +165,6 @@ def weighted_objective(
     return float(torch.mean(err * err).item())
 
 
-def append_jsonl(path: Path, rec: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def should_reuse_step1_init(meta: dict, qtype: str) -> bool:
-    weighted = bool(meta.get("uses_hessian_weighting", False))
-    if qtype == "hessian-aware":
-        return weighted
-    return not weighted
-
-
 def load_context(args: argparse.Namespace) -> dict:
     step1_dir = Path(args.step1_dir).resolve()
     codebook_path = step1_dir / "codebook.pt"
@@ -214,13 +173,14 @@ def load_context(args: argparse.Namespace) -> dict:
     if not (codebook_path.exists() and qcodes_path.exists() and meta_path.exists()):
         raise FileNotFoundError("step1_dir must contain codebook.pt, qcodes.pt, meta.pt")
 
-    print(f"[Alt-Step3] loading step1 artifacts: {step1_dir}")
+    print(f"[SVD-Step3] loading step1 artifacts: {step1_dir}")
     codebooks: Dict[str, torch.Tensor] = torch.load(codebook_path, map_location="cpu")
     qcodes: Dict[str, torch.Tensor] = torch.load(qcodes_path, map_location="cpu")
     metas: Dict[str, dict] = torch.load(meta_path, map_location="cpu")
 
-    print(f"[Alt-Step3] loading calib_s: {args.calib_s}")
-    calib_s: Dict[str, dict] = torch.load(args.calib_s, map_location="cpu")
+    print(f"[SVD-Step3] loading calib_s: {args.calib_s}")
+    calib_payload = torch.load(args.calib_s, map_location="cpu")
+    calib_s: Dict[str, dict] = calib_payload.get("cov_ops", calib_payload)
 
     if args.dtype_w == "fp16":
         load_dtype = torch.float16
@@ -234,7 +194,7 @@ def load_context(args: argparse.Namespace) -> dict:
     resolved_model_device_map = None if dm_raw in {"", "none", "null"} else args.model_device_map
 
     print(
-        f"[Alt-Step3] loading original model: {args.model_id} "
+        f"[SVD-Step3] loading original model: {args.model_id} "
         f"(device_map={resolved_model_device_map}, device={device})"
     )
     model = AutoModelForCausalLM.from_pretrained(
@@ -251,7 +211,7 @@ def load_context(args: argparse.Namespace) -> dict:
     except NotImplementedError:
         if resolved_model_device_map is None:
             raise
-        print("[Alt-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
+        print("[SVD-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -289,7 +249,7 @@ def load_context(args: argparse.Namespace) -> dict:
     if not keys:
         raise RuntimeError("No matched layers found.")
 
-    print(f"[Alt-Step3] matched layers: {len(keys)}")
+    print(f"[SVD-Step3] matched layers: {len(keys)}")
     return {
         "device": device,
         "codebooks": codebooks,
@@ -305,7 +265,6 @@ def optimize_layer(
     key: str,
     ctx: dict,
     args: argparse.Namespace,
-    metrics_path: Path,
 ) -> dict:
     device = ctx["device"]
     codebooks = ctx["codebooks"]
@@ -318,7 +277,6 @@ def optimize_layer(
     bits = int(meta["bits"])
     gs = int(meta["group_size"])
     orig_i = int(tuple(meta["orig_shape"])[1])
-    clip_pct = float(meta.get("clip_percentile", 0.0) if args.clip_percentile is None else args.clip_percentile)
 
     w_cpu = state[key].to(torch.float32)
     d_cpu = load_diag_weight(calib_s[key], eps=float(args.eps))
@@ -329,100 +287,20 @@ def optimize_layer(
 
     w = w_cpu.to(device)
     d = d_cpu.to(device)
-    hdiag = (d * d) if args.qtype == "hessian-aware" else None
+    codebook = codebooks[key].to(device=device, dtype=torch.float32)
+    qcodes = qcodes_dict[key].to(device=device)
+    wq = dequant_from_codebook_codes(codebook, qcodes, orig_i=orig_i)
 
-    if should_reuse_step1_init(meta, args.qtype):
-        codebook = codebooks[key].to(device=device, dtype=torch.float32)
-        qcodes = qcodes_dict[key].to(device=device)
-        wq = dequant_from_codebook_codes(codebook, qcodes, orig_i=orig_i)
-        init_source = "step1_artifact"
-    else:
-        wq, codebook, qcodes, _ = lloyd_asym_nonuniform_quantize(
-            w,
-            b=bits,
-            group_size=gs,
-            clip_pct=clip_pct,
-            lloyd_iter=int(args.lloyd_iter),
-            chunk_groups=int(args.chunk_groups),
-            hessian_diag=hdiag,
-        )
-        init_source = "recomputed"
+    residual = w - wq
+    a, b = weighted_low_rank_fit(residual, d, rank=int(args.rank_ab), eps=float(args.eps))
+    objective_weighted = weighted_objective(w, wq, a, b, d)
 
-    a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
-    obj = weighted_objective(w, wq, a, b, d)
+    residual_bar = residual * d.unsqueeze(0)
+    total_energy = float((residual_bar * residual_bar).sum().item())
+    captured = (a @ b) * d.unsqueeze(0)
+    captured_energy = float((captured * captured).sum().item()) if a.numel() and b.numel() else 0.0
+    rank_used = int(a.shape[1])
 
-    best = {
-        "objective": float(obj),
-        "outer": -1,
-        "wdq": wq.detach().clone(),
-        "A": a.detach().clone(),
-        "B": b.detach().clone(),
-    }
-
-    append_jsonl(
-        metrics_path,
-        {
-            "layer": key,
-            "outer": -1,
-            "phase": "init",
-            "objective_weighted": float(obj),
-            "bits": bits,
-            "group_size": gs,
-            "rank_ab": int(args.rank_ab),
-            "qtype": args.qtype,
-            "init_source": init_source,
-        },
-    )
-
-    final_quant_meta = {
-        "bits": bits,
-        "group_size": gs,
-        "clip_percentile": float(clip_pct),
-        "qtype": str(args.qtype),
-        "init_source": str(init_source),
-    }
-
-    for outer in range(int(args.outer_loops)):
-        a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
-        target = w - (a @ b)
-        wq, codebook, qcodes, quant_meta = lloyd_asym_nonuniform_quantize(
-            target,
-            b=bits,
-            group_size=gs,
-            clip_pct=clip_pct,
-            lloyd_iter=int(args.lloyd_iter),
-            chunk_groups=int(args.chunk_groups),
-            hessian_diag=hdiag,
-        )
-        final_quant_meta = dict(quant_meta)
-        final_quant_meta["qtype"] = str(args.qtype)
-        final_quant_meta["clip_percentile"] = float(clip_pct)
-        obj = weighted_objective(w, wq, a, b, d)
-
-        append_jsonl(
-            metrics_path,
-            {
-                "layer": key,
-                "outer": int(outer),
-                "phase": "alternating",
-                "objective_weighted": float(obj),
-                "bits": bits,
-                "group_size": gs,
-                "rank_ab": int(args.rank_ab),
-                "qtype": args.qtype,
-            },
-        )
-
-        if obj < best["objective"]:
-            best = {
-                "objective": float(obj),
-                "outer": int(outer),
-                "wdq": wq.detach().clone(),
-                "A": a.detach().clone(),
-                "B": b.detach().clone(),
-            }
-
-    final_obj = weighted_objective(w, wq, a, b, d)
     return {
         "wdq": wq.detach().to(torch.float16).cpu(),
         "low_rank_ab": {
@@ -430,42 +308,32 @@ def optimize_layer(
             "B": b.detach().to(torch.float16).cpu(),
             "meta": {
                 "rank": int(args.rank_ab),
+                "rank_used": rank_used,
                 "bits": bits,
                 "group_size": gs,
-                "qtype": str(args.qtype),
-                "objective_weighted_final": float(final_obj),
-            },
-        },
-        "wdq_best": best["wdq"].detach().to(torch.float16).cpu(),
-        "low_rank_ab_best": {
-            "A": best["A"].detach().to(torch.float16).cpu(),
-            "B": best["B"].detach().to(torch.float16).cpu(),
-            "meta": {
-                "rank": int(args.rank_ab),
-                "bits": bits,
-                "group_size": gs,
-                "qtype": str(args.qtype),
-                "best_outer": int(best["outer"]),
-                "objective_weighted_best": float(best["objective"]),
+                "objective_weighted": float(objective_weighted),
+                "weighted_residual_energy": total_energy,
+                "weighted_evr_at_rank": float(captured_energy / max(total_energy, 1e-12)),
             },
         },
         "codebook": codebook.detach().to(torch.float16).cpu(),
         "qcodes": qcodes.detach().cpu(),
-        "quant_meta": final_quant_meta,
+        "quant_meta": dict(meta),
         "summary": {
             "layer": key,
             "bits": bits,
             "group_size": gs,
-            "init_source": init_source,
-            "objective_weighted_final": float(final_obj),
-            "objective_weighted_best": float(best["objective"]),
-            "best_outer": int(best["outer"]),
+            "rank_ab": int(args.rank_ab),
+            "rank_used": rank_used,
+            "objective_weighted": float(objective_weighted),
+            "weighted_residual_energy": total_energy,
+            "weighted_evr_at_rank": float(captured_energy / max(total_energy, 1e-12)),
         },
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Alt Step3 - Alternating Lloyd-Max + Low-Rank Compensation")
+    ap = argparse.ArgumentParser("Alt Step3 - Weighted residual SVD after Step1 quantization")
     ap.add_argument("--model_id", required=True)
     ap.add_argument("--revision", default=None)
     ap.add_argument("--trust_remote_code", action="store_true")
@@ -478,33 +346,21 @@ def main() -> None:
     ap.add_argument("--model_device_map", default="auto", help='Model load placement: e.g. "auto" or "none"')
     ap.add_argument("--dtype_w", default="fp16", choices=["fp16", "bf16", "fp32"])
 
-    ap.add_argument("--qtype", default="hessian-aware", choices=["plain", "hessian-aware"])
     ap.add_argument("--rank_ab", type=int, default=64)
-    ap.add_argument("--outer_loops", type=int, default=4)
-    ap.add_argument("--lloyd_iter", type=int, default=12)
-    ap.add_argument("--chunk_groups", type=int, default=4096)
-    ap.add_argument("--clip_percentile", type=float, default=None)
+    ap.add_argument("--svd_mode", default="weighted_svd", choices=["weighted_svd"])
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--layer_regex", type=str, default=None)
     ap.add_argument("--max_layers", type=int, default=0)
     ap.add_argument("--save_every_layer", action="store_true")
-    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-
-    set_seed(args.seed)
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = out_dir / "metrics.jsonl"
-    if metrics_path.exists():
-        metrics_path.unlink()
 
     ctx = load_context(args)
 
     wdq_out: Dict[str, torch.Tensor] = {}
     ab_out: Dict[str, Dict[str, torch.Tensor]] = {}
-    wdq_best_out: Dict[str, torch.Tensor] = {}
-    ab_best_out: Dict[str, Dict[str, torch.Tensor]] = {}
     codebook_out: Dict[str, torch.Tensor] = {}
     qcodes_out: Dict[str, torch.Tensor] = {}
     quant_meta_out: Dict[str, dict] = {}
@@ -512,12 +368,10 @@ def main() -> None:
 
     t0 = time.time()
     for idx, key in enumerate(ctx["keys"], start=1):
-        print(f"[Alt-Step3] ({idx}/{len(ctx['keys'])}) optimizing: {key}")
-        layer_res = optimize_layer(key=key, ctx=ctx, args=args, metrics_path=metrics_path)
+        print(f"[SVD-Step3] ({idx}/{len(ctx['keys'])}) fitting: {key}")
+        layer_res = optimize_layer(key=key, ctx=ctx, args=args)
         wdq_out[key] = layer_res["wdq"]
         ab_out[key] = layer_res["low_rank_ab"]
-        wdq_best_out[key] = layer_res["wdq_best"]
-        ab_best_out[key] = layer_res["low_rank_ab_best"]
         codebook_out[key] = layer_res["codebook"]
         qcodes_out[key] = layer_res["qcodes"]
         quant_meta_out[key] = layer_res["quant_meta"]
@@ -526,8 +380,6 @@ def main() -> None:
         if args.save_every_layer:
             torch.save(wdq_out, out_dir / "wdq_star.pt")
             torch.save(ab_out, out_dir / "low_rank_ab.pt")
-            torch.save(wdq_best_out, out_dir / "wdq_star_best.pt")
-            torch.save(ab_best_out, out_dir / "low_rank_ab_best.pt")
             torch.save(codebook_out, out_dir / "codebook_star.pt")
             torch.save(qcodes_out, out_dir / "qcodes_star.pt")
             torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
@@ -539,36 +391,30 @@ def main() -> None:
 
     torch.save(wdq_out, out_dir / "wdq_star.pt")
     torch.save(ab_out, out_dir / "low_rank_ab.pt")
-    torch.save(wdq_best_out, out_dir / "wdq_star_best.pt")
-    torch.save(ab_best_out, out_dir / "low_rank_ab_best.pt")
     torch.save(codebook_out, out_dir / "codebook_star.pt")
     torch.save(qcodes_out, out_dir / "qcodes_star.pt")
     torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
 
-    final_mean = sum(x["objective_weighted_final"] for x in layer_summaries) / max(1, len(layer_summaries))
-    best_mean = sum(x["objective_weighted_best"] for x in layer_summaries) / max(1, len(layer_summaries))
+    objective_mean = sum(x["objective_weighted"] for x in layer_summaries) / max(1, len(layer_summaries))
+    evr_mean = sum(x["weighted_evr_at_rank"] for x in layer_summaries) / max(1, len(layer_summaries))
     summary = {
         "model_id": args.model_id,
         "revision": args.revision,
         "step1_dir": str(Path(args.step1_dir).resolve()),
         "calib_s": str(Path(args.calib_s).resolve()),
         "out_dir": str(out_dir),
-        "qtype": str(args.qtype),
         "rank_ab": int(args.rank_ab),
-        "outer_loops": int(args.outer_loops),
-        "lloyd_iter": int(args.lloyd_iter),
-        "chunk_groups": int(args.chunk_groups),
-        "clip_percentile_override": args.clip_percentile,
+        "svd_mode": str(args.svd_mode),
         "num_layers": len(layer_summaries),
-        "objective_weighted_final_mean": float(final_mean),
-        "objective_weighted_best_mean": float(best_mean),
+        "objective_weighted_mean": float(objective_mean),
+        "weighted_evr_at_rank_mean": float(evr_mean),
         "elapsed_sec": time.time() - t0,
         "layers": layer_summaries,
     }
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("[Alt-Step3] saved:")
+    print("[SVD-Step3] saved:")
     print(f"  wdq*: {out_dir / 'wdq_star.pt'}")
     print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}")
     print(f"  summary: {out_dir / 'summary.json'}")
@@ -602,7 +448,7 @@ def _invoke_local_main(argv: Sequence[str]) -> subprocess.CompletedProcess:
 
 
 @dataclass
-class Step03AlternatingConfig:
+class Step03SVDConfig:
     model_id: str
     step1_dir: str
     calib_s: str
@@ -612,22 +458,17 @@ class Step03AlternatingConfig:
     device: str = "cuda"
     model_device_map: str = "auto"
     dtype_w: str = "fp16"
-    qtype: str = "hessian-aware"
     rank_ab: int = 64
-    outer_loops: int = 4
-    lloyd_iter: int = 12
-    chunk_groups: int = 4096
-    clip_percentile: Optional[float] = None
+    svd_mode: str = "weighted_svd"
     eps: float = 1e-8
     layer_regex: Optional[str] = None
     max_layers: int = 0
     save_every_layer: bool = False
-    seed: int = 42
     python_exe: str = sys.executable
     source_script: str = str(Path(__file__).resolve())
 
 
-def build_command(cfg: Step03AlternatingConfig) -> List[str]:
+def build_command(cfg: Step03SVDConfig) -> List[str]:
     cmd: List[str] = [
         str(cfg.python_exe),
         str(cfg.source_script),
@@ -645,29 +486,19 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         str(cfg.model_device_map),
         "--dtype_w",
         str(cfg.dtype_w),
-        "--qtype",
-        str(cfg.qtype),
         "--rank_ab",
         str(int(cfg.rank_ab)),
-        "--outer_loops",
-        str(int(cfg.outer_loops)),
-        "--lloyd_iter",
-        str(int(cfg.lloyd_iter)),
-        "--chunk_groups",
-        str(int(cfg.chunk_groups)),
+        "--svd_mode",
+        str(cfg.svd_mode),
         "--eps",
         str(float(cfg.eps)),
         "--max_layers",
         str(int(cfg.max_layers)),
-        "--seed",
-        str(int(cfg.seed)),
     ]
     if cfg.revision:
         cmd += ["--revision", str(cfg.revision)]
     if cfg.trust_remote_code:
         cmd.append("--trust_remote_code")
-    if cfg.clip_percentile is not None:
-        cmd += ["--clip_percentile", str(float(cfg.clip_percentile))]
     if cfg.layer_regex:
         cmd += ["--layer_regex", str(cfg.layer_regex)]
     if cfg.save_every_layer:
@@ -675,7 +506,7 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
     return cmd
 
 
-def run(cfg: Step03AlternatingConfig, check: bool = True) -> subprocess.CompletedProcess:
+def run(cfg: Step03SVDConfig, check: bool = True) -> subprocess.CompletedProcess:
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
     cp = _invoke_local_main(build_command(cfg)[2:])
     if check and cp.returncode != 0:
