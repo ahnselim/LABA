@@ -10,28 +10,45 @@ step2_1 artifacts into step2_2 automatically.
 기본값으로 init seed(`init_assign_csv`)를 `cvx/step1_3c_opt.py`로 자동 생성한다.
 
 기본 사용 (step2_1 + step2_2 연속 실행):
-CUDA_VISIBLE_DEVICES=1 nohup python step2_greedy_mc.py \
+CUDA_VISIBLE_DEVICES=3 nohup python step2_greedy_mc.py \
   --model_id meta-llama/Llama-3.1-8B \
-  --sens_csv ./output/llama3_8b/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
-  --alpha_csv ./output/llama3_8b/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \
-  --prebake_root ./output/llama3_8b/output_step0_prebake_alt \
+  --sens_csv ./output/llama_3_8/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
+  --alpha_csv ./output/llama_3_8/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \
+  --prebake_root ./output/llama_3_8/output_step0_prebake_alt \
   --target_avg_bits 2.25 \
-  --out_root ./output/llama3_8b/output_step2_mc_greedy/2_25bit \
+  --out_root ./output/llama_3_8/output_step2_mc_greedy/2_25bit \
   --gpu_id 0 \
   --use_round_band \
   --warmup_bits_lo 2.0 --warmup_bits_hi 2.5 \
   --round_quantum 0.01 > ./logs/step2_mc_llama3_8b_225.log 2>&1 &
 
 Warmup(step2_1) 재사용하고 step2_2만 실행 : 
-CUDA_VISIBLE_DEVICES=0 python LABA/mixture/step2_greedy_mc.py \
+CUDA_VISIBLE_DEVICES=3 nohup python step2_greedy_mc.py \
   --model_id meta-llama/Llama-3.2-3B \
-  --sens_csv ./output/output_step1_cvx/step1_1/layerwise_sensitivity.csv \
-  --alpha_csv ./output/output_step1_cvx/step1_2/alpha_layerwise.csv \
-  --prebake_root ./output/output_step0_prebake \
-  --target_avg_bits 2.6 \
-  --out_root ./output/output_step2_mc \
+  --sens_csv ./output/llama_3_8/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
+  --alpha_csv ./output/llama_3_8/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \
+  --prebake_root ./output/llama_3_8/output_step0_prebake_alt \
+  --target_avg_bits 2.5 \
+  --out_root ./output/llama_3_8/output_step2_mc_greedy/2_25bit \
+  --step2_2_dir ./2_5bit \
+    --use_round_band \
   --skip_step2_1 \
-  --resume
+  --resume \
+  --round_quantum 0.01 > ./logs/step2_mc_llama3_8b_25.log 2>&1 &
+
+step2_1만 실행:
+CUDA_VISIBLE_DEVICES=0 python LABA/alt/step2_greedy_mc.py \
+  --model_id meta-llama/Llama-3.1-8B \
+  --sens_csv ./output/llama_3_8/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
+  --alpha_csv ./output/llama_3_8/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \
+  --prebake_root ./output/llama_3_8/output_step0_prebake_alt \
+  --target_avg_bits 2.25 \
+  --out_root ./output/llama_3_8/output_step2_mc_greedy/2_25bit \
+  --gpu_id 0 \
+  --use_round_band \
+  --warmup_bits_lo 2.0 --warmup_bits_hi 2.5 \
+  --round_quantum 0.01 \
+  --only_step2_1
 
 """
 
@@ -368,6 +385,7 @@ def main() -> None:
     # Orchestration
     ap.add_argument("--step2_1_dirname", default="step2_1")
     ap.add_argument("--step2_2_dirname", default="step2_2")
+    ap.add_argument("--only_step2_1", action="store_true", help="Run step2_1 only and stop before step2_2")
     ap.add_argument("--skip_step2_1", action="store_true", help="Reuse existing step2_1 outputs in out_root")
     ap.add_argument("--step2_1_set", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--step2_2_set", action="append", default=[], metavar="KEY=VALUE")
@@ -514,6 +532,53 @@ def main() -> None:
     warmup_ckpt_json = _require_exists(s21["warmup_ckpt_path"], "step2_1 warmup_ckpt_path")
     base_surrogate_ckpt = _require_exists(s21["surrogate_best_ckpt"], "step2_1 surrogate_best_ckpt")
     base_surrogate_config = _require_exists(s21["surrogate_config"], "step2_1 surrogate_config")
+
+    if args.only_step2_1:
+        meta = {
+            "model_id": args.model_id,
+            "sens_csv": str(sens_csv),
+            "alpha_csv": str(alpha_csv),
+            "prebake_root": str(prebake_root),
+            "surrogate_static_info": str(surrogate_static_info),
+            "target_avg_bits": float(args.target_avg_bits),
+            "init_assign_csv": str(init_assign_csv_for_step21) if init_assign_csv_for_step21 else args.init_assign_csv,
+            "step2_2_init_assign_csv": None,
+            "auto_seed_with_step1_3c": bool(args.auto_seed_with_step1_3c),
+            "out_root": str(out_root),
+            "created": int(time.time()),
+            "elapsed_sec": time.time() - t0,
+            "steps": {
+                "step2_1": str(d21),
+                "step2_2": None,
+            },
+            "artifacts": {
+                "step2_1_summary": str(summary_path),
+                "warmup_ckpt_json": str(warmup_ckpt_json),
+                "base_training_csv": str(base_training_csv),
+                "base_surrogate_ckpt": str(base_surrogate_ckpt),
+                "base_surrogate_config": str(base_surrogate_config),
+                "bit_assign_csv": None,
+                "step1_3c_seed_csv": (
+                    str(init_assign_csv_for_step21)
+                    if (
+                        init_assign_csv_for_step21 is not None
+                        and init_assign_csv_for_step21.resolve() == expected_auto_seed_csv
+                    )
+                    else None
+                ),
+                "step1_3c_seed_csv_step2_2": None,
+                "ppl_curve_csv": None,
+                "run_ckpt_json": None,
+            },
+            "results": {
+                "step2_1": res21,
+                "step2_2": None,
+            },
+        }
+        _write_json(out_root / "meta.json", meta)
+        print("[step2-mc] only_step2_1 set -> skip step2_2.", flush=True)
+        print(f"[step2-mc] Done. meta: {out_root / 'meta.json'}", flush=True)
+        return
 
     init_assign_csv_for_step22 = _resolve_or_build_step13_seed(
         requested_path=args.step2_2_init_assign_csv,

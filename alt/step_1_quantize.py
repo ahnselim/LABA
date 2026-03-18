@@ -17,13 +17,13 @@ Mixture step0 module: Step0-1 quantization (Lloyd-Max asym non-uniform baseline)
 참고:
   - `LABA/mixture/step0_optimization.py`와의 호환을 위해 래퍼 API를 함께 제공한다.
 
-CUDA_VISIBLE_DEVICES=1 nohup \
+CUDA_VISIBLE_DEVICES=1 \
 python step_1_quantize.py \
-  --model_id meta-llama/Llama-3.1-8B \
-  --bits 2 \
+  --model_id Qwen/Qwen3-8B \
+  --bits 1 \
   --group_size 128 \
-  --calib_s_path ./output/llama3_8b_128/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_8b_128/step1_quant/2bit > ./logs/quant_2bit.log 2>&1 &
+  --calib_s_path ./output/qwen3_8b/calib_sqrtdiag.pt \
+  --out_dir ./output/qwen3_8b/step1_quant/1bit
   
 """
 

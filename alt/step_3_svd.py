@@ -12,16 +12,21 @@ What this script does:
        - `wdq_star.pt`
        - `low_rank_ab.pt`
      so `step4_eval.py` can evaluate them directly
+     Optional with `--save_all`:
+       - `codebook_star.pt`
+       - `qcodes_star.pt`
+       - `quant_meta_star.pt`
+       - `summary.json`
 
 Usage:
 CUDA_VISIBLE_DEVICES=2 nohup python step_3_svd.py \
   --model_id meta-llama/Llama-3.1-8B \
-  --step1_dir ./output/llama3_8b_64/step1_quant/1bit \
-  --calib_s ./output/llama3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_8b_64/step3_svd/1bit \
+  --step1_dir ./output/llama3_8b/step1_quant/2bit \
+  --calib_s ./output/llama3_8b/calib_sqrtdiag.pt \
+  --out_dir ./output/llama3_8b/step3_svd/2bit \
   --rank_ab 64 \
   --device cuda \
-  --model_device_map auto > ./logs/llama3_8b_1bit_svd.log 2>&1 &
+  --model_device_map auto > ./logs/llama3_8b_4bit_svd.log 2>&1 &
 
 """
 
@@ -173,12 +178,12 @@ def load_context(args: argparse.Namespace) -> dict:
     if not (codebook_path.exists() and qcodes_path.exists() and meta_path.exists()):
         raise FileNotFoundError("step1_dir must contain codebook.pt, qcodes.pt, meta.pt")
 
-    print(f"[SVD-Step3] loading step1 artifacts: {step1_dir}")
+    print(f"[SVD-Step3] loading step1 artifacts: {step1_dir}", flush=True)
     codebooks: Dict[str, torch.Tensor] = torch.load(codebook_path, map_location="cpu")
     qcodes: Dict[str, torch.Tensor] = torch.load(qcodes_path, map_location="cpu")
     metas: Dict[str, dict] = torch.load(meta_path, map_location="cpu")
 
-    print(f"[SVD-Step3] loading calib_s: {args.calib_s}")
+    print(f"[SVD-Step3] loading calib_s: {args.calib_s}", flush=True)
     calib_payload = torch.load(args.calib_s, map_location="cpu")
     calib_s: Dict[str, dict] = calib_payload.get("cov_ops", calib_payload)
 
@@ -196,7 +201,7 @@ def load_context(args: argparse.Namespace) -> dict:
     print(
         f"[SVD-Step3] loading original model: {args.model_id} "
         f"(device_map={resolved_model_device_map}, device={device})"
-    )
+    , flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         revision=args.revision,
@@ -211,7 +216,7 @@ def load_context(args: argparse.Namespace) -> dict:
     except NotImplementedError:
         if resolved_model_device_map is None:
             raise
-        print("[SVD-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.")
+        print("[SVD-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.", flush=True)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -249,7 +254,7 @@ def load_context(args: argparse.Namespace) -> dict:
     if not keys:
         raise RuntimeError("No matched layers found.")
 
-    print(f"[SVD-Step3] matched layers: {len(keys)}")
+    print(f"[SVD-Step3] matched layers: {len(keys)}", flush=True)
     return {
         "device": device,
         "codebooks": codebooks,
@@ -352,6 +357,11 @@ def main() -> None:
     ap.add_argument("--layer_regex", type=str, default=None)
     ap.add_argument("--max_layers", type=int, default=0)
     ap.add_argument("--save_every_layer", action="store_true")
+    ap.add_argument(
+        "--save_all",
+        action="store_true",
+        help="Also save codebook/qcodes/quant_meta artifacts and summary.json",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir).resolve()
@@ -368,7 +378,7 @@ def main() -> None:
 
     t0 = time.time()
     for idx, key in enumerate(ctx["keys"], start=1):
-        print(f"[SVD-Step3] ({idx}/{len(ctx['keys'])}) fitting: {key}")
+        print(f"[SVD-Step3] ({idx}/{len(ctx['keys'])}) fitting: {key}", flush=True)
         layer_res = optimize_layer(key=key, ctx=ctx, args=args)
         wdq_out[key] = layer_res["wdq"]
         ab_out[key] = layer_res["low_rank_ab"]
@@ -380,9 +390,10 @@ def main() -> None:
         if args.save_every_layer:
             torch.save(wdq_out, out_dir / "wdq_star.pt")
             torch.save(ab_out, out_dir / "low_rank_ab.pt")
-            torch.save(codebook_out, out_dir / "codebook_star.pt")
-            torch.save(qcodes_out, out_dir / "qcodes_star.pt")
-            torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
+            if args.save_all:
+                torch.save(codebook_out, out_dir / "codebook_star.pt")
+                torch.save(qcodes_out, out_dir / "qcodes_star.pt")
+                torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
 
         if torch.cuda.is_available() and (idx % 8 == 0 or idx == len(ctx["keys"])):
             torch.cuda.empty_cache()
@@ -391,9 +402,10 @@ def main() -> None:
 
     torch.save(wdq_out, out_dir / "wdq_star.pt")
     torch.save(ab_out, out_dir / "low_rank_ab.pt")
-    torch.save(codebook_out, out_dir / "codebook_star.pt")
-    torch.save(qcodes_out, out_dir / "qcodes_star.pt")
-    torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
+    if args.save_all:
+        torch.save(codebook_out, out_dir / "codebook_star.pt")
+        torch.save(qcodes_out, out_dir / "qcodes_star.pt")
+        torch.save(quant_meta_out, out_dir / "quant_meta_star.pt")
 
     objective_mean = sum(x["objective_weighted"] for x in layer_summaries) / max(1, len(layer_summaries))
     evr_mean = sum(x["weighted_evr_at_rank"] for x in layer_summaries) / max(1, len(layer_summaries))
@@ -411,13 +423,15 @@ def main() -> None:
         "elapsed_sec": time.time() - t0,
         "layers": layer_summaries,
     }
-    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    if args.save_all:
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("[SVD-Step3] saved:")
-    print(f"  wdq*: {out_dir / 'wdq_star.pt'}")
-    print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}")
-    print(f"  summary: {out_dir / 'summary.json'}")
+    print("[SVD-Step3] saved:", flush=True)
+    print(f"  wdq*: {out_dir / 'wdq_star.pt'}", flush=True)
+    print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}", flush=True)
+    if args.save_all:
+        print(f"  summary: {out_dir / 'summary.json'}", flush=True)
 
 
 if __name__ == "__main__":

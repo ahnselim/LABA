@@ -13,12 +13,10 @@ Output layout:
     summaries/bit{b}.json
 
 Example:
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=3 \
   python utils/prebake_from_alternating.py \
-    --out_root ./output/llama3_8b/output_step0_prebake_alt \
-    --step3 1=./output/llama3_8b/step3_alt/1bit_50 \
-    --step3 2=./output/llama3_8b/step3_alt/2bit_50 \
-    --step3 3=./output/llama3_8b/step3_alt/3bit_50 \
+    --out_root ./output/llama_3_8/output_step0_prebake_alt \
+    --step3 2=./output/llama3_8b/step3_alt/2bit_100 \
     --step3 4=./output/llama3_8b/step3_alt/4bit_50 
     
 CUDA_VISIBLE_DEVICES=1 \
