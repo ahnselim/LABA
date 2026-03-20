@@ -1,14 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Alternative Step3: LABA-style alternating Lloyd-Max + layerwise low-rank compensation.
+Alternative Step3 (1-bit): LABA-style alternating Lloyd-Max + layerwise low-rank compensation
+with conservative regularization for 1-bit quantization.
 
 Algorithm:
-  1) Initialize Wq^(0) with Lloyd-Max quantization.
-  2) Fit weighted rank-r low-rank factors on residual (W - Wq) D.
+  1) Initialize Wq^(0) with 1-bit Lloyd-Max quantization.
+  2) Fit weighted rank-r low-rank factors on residual (W - Wq) D with
+     lambda_ab * ||AB D||_F^2 regularization.
   3) Alternate:
-       - AB update:  min || (W - Wq - AB) D ||_F^2
+       - AB update:  min || (W - Wq - AB) D ||_F^2 + lambda_ab ||AB D||_F^2
        - Wq update:  min_{Wq in Q} || (W - AB - Wq) D ||_F^2
+                     + lambda_q0 || (Wq - Wq^(0)) D ||_F^2
 
 Outputs:
   - out_dir/wdq_star.pt
@@ -22,25 +25,17 @@ Outputs:
     - out_dir/quant_meta_star.pt
     - out_dir/summary.json
  
-CUDA_VISIBLE_DEVICES=1 nohup \
-python step_3_alternating.py \
+CUDA_VISIBLE_DEVICES=0 nohup \
+python step_3_1bit_alt.py \
   --model_id Qwen/Qwen3-8B \
-  --step1_dir ./output/qwen3_8b_64/step1_quant/4bit \
+  --step1_dir ./output/qwen3_8b_64/step1_quant/1bit \
   --calib_s ./output/qwen3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/qwen3_8b_64/step3_alt/4bit_50 \
+  --out_dir ./output/qwen3_8b_64/step3_alt/1bit_reg \
   --qtype hessian-aware \
   --rank_ab 64 \
-  --outer_loops 50 > ./logs/qwen3_8b_3bit_50.log 2>&1 &
-  
-CUDA_VISIBLE_DEVICES=1 nohup \
-python step_3_alternating.py \
-  --model_id meta-llama/Llama-3.2-3B \
-  --step1_dir ./output/llama3_3b_64/step1_quant/3bit \
-  --calib_s ./output/llama3_3b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_3b_64/step3_alt/3bit_50 \
-  --qtype hessian-aware \
-  --rank_ab 64 \
-  --outer_loops 50 > ./logs/llama3_3b_3bit_50.log 2>&1 &
+  --outer_loops 100 \
+  --lambda_q0 0.25 \
+  --lambda_ab 0.01 > ./logs/qwen3_8b_1bit_reg.log 2>&1 &
 
 """
 
@@ -172,9 +167,12 @@ def weighted_low_rank_fit(
     diag_weight: torch.Tensor,
     rank: int,
     eps: float,
+    lambda_ab: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     d = diag_weight.to(device=residual.device, dtype=torch.float32)
     residual_bar = residual * d.unsqueeze(0)
+    if float(lambda_ab) > 0.0:
+        residual_bar = residual_bar / (1.0 + float(lambda_ab))
     a, b_bar = rank_r_svd(residual_bar, r=int(rank))
     inv_d = 1.0 / d.clamp_min(float(eps))
     b = b_bar * inv_d.unsqueeze(0)
@@ -188,10 +186,29 @@ def weighted_objective(
     a: torch.Tensor,
     b: torch.Tensor,
     diag_weight: torch.Tensor,
-) -> float:
+    wq_anchor: Optional[torch.Tensor] = None,
+    lambda_q0: float = 0.0,
+    lambda_ab: float = 0.0,
+) -> Dict[str, float]:
     d = diag_weight.to(device=w.device, dtype=torch.float32)
-    err = (w - wq - (a @ b)) * d.unsqueeze(0)
-    return float(torch.mean(err * err).item())
+    ab = a @ b
+    err = (w - wq - ab) * d.unsqueeze(0)
+    recon = float(torch.mean(err * err).item())
+    anchor = 0.0
+    if wq_anchor is not None and float(lambda_q0) > 0.0:
+        anchor_err = (wq - wq_anchor) * d.unsqueeze(0)
+        anchor = float(torch.mean(anchor_err * anchor_err).item())
+    ab_reg = 0.0
+    if float(lambda_ab) > 0.0:
+        abd = ab * d.unsqueeze(0)
+        ab_reg = float(torch.mean(abd * abd).item())
+    total = recon + float(lambda_q0) * anchor + float(lambda_ab) * ab_reg
+    return {
+        "recon": recon,
+        "anchor": anchor,
+        "ab_reg": ab_reg,
+        "total": total,
+    }
 
 
 def append_jsonl(path: Path, rec: dict) -> None:
@@ -317,6 +334,8 @@ def optimize_layer(
 
     meta = metas[key]
     bits = int(meta["bits"])
+    if bits != 1:
+        raise RuntimeError(f"{Path(__file__).name} is 1-bit only, but {key} has bits={bits}")
     gs = int(meta["group_size"])
     orig_i = int(tuple(meta["orig_shape"])[1])
     clip_pct = float(meta.get("clip_percentile", 0.0) if args.clip_percentile is None else args.clip_percentile)
@@ -349,11 +368,30 @@ def optimize_layer(
         )
         init_source = "recomputed"
 
-    a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
-    obj = weighted_objective(w, wq, a, b, d)
+    wq0 = wq.detach().clone()
+    a, b = weighted_low_rank_fit(
+        w - wq,
+        d,
+        rank=int(args.rank_ab),
+        eps=float(args.eps),
+        lambda_ab=float(args.lambda_ab),
+    )
+    metrics = weighted_objective(
+        w,
+        wq,
+        a,
+        b,
+        d,
+        wq_anchor=wq0,
+        lambda_q0=float(args.lambda_q0),
+        lambda_ab=float(args.lambda_ab),
+    )
 
     best = {
-        "objective": float(obj),
+        "objective": float(metrics["total"]),
+        "objective_recon": float(metrics["recon"]),
+        "objective_anchor": float(metrics["anchor"]),
+        "objective_ab_reg": float(metrics["ab_reg"]),
         "outer": -1,
         "wdq": wq.detach().clone(),
         "A": a.detach().clone(),
@@ -366,12 +404,17 @@ def optimize_layer(
             "layer": key,
             "outer": -1,
             "phase": "init",
-            "objective_weighted": float(obj),
+            "objective_weighted": float(metrics["total"]),
+            "objective_weighted_recon": float(metrics["recon"]),
+            "objective_weighted_anchor": float(metrics["anchor"]),
+            "objective_weighted_ab_reg": float(metrics["ab_reg"]),
             "bits": bits,
             "group_size": gs,
             "rank_ab": int(args.rank_ab),
             "qtype": args.qtype,
             "init_source": init_source,
+            "lambda_q0": float(args.lambda_q0),
+            "lambda_ab": float(args.lambda_ab),
         },
     )
 
@@ -381,11 +424,21 @@ def optimize_layer(
         "clip_percentile": float(clip_pct),
         "qtype": str(args.qtype),
         "init_source": str(init_source),
+        "lambda_q0": float(args.lambda_q0),
+        "lambda_ab": float(args.lambda_ab),
     }
 
     for outer in range(int(args.outer_loops)):
-        a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
+        a, b = weighted_low_rank_fit(
+            w - wq,
+            d,
+            rank=int(args.rank_ab),
+            eps=float(args.eps),
+            lambda_ab=float(args.lambda_ab),
+        )
         target = w - (a @ b)
+        if float(args.lambda_q0) > 0.0:
+            target = (target + float(args.lambda_q0) * wq0) / (1.0 + float(args.lambda_q0))
         wq, codebook, qcodes, quant_meta = lloyd_asym_nonuniform_quantize(
             target,
             b=bits,
@@ -398,7 +451,18 @@ def optimize_layer(
         final_quant_meta = dict(quant_meta)
         final_quant_meta["qtype"] = str(args.qtype)
         final_quant_meta["clip_percentile"] = float(clip_pct)
-        obj = weighted_objective(w, wq, a, b, d)
+        final_quant_meta["lambda_q0"] = float(args.lambda_q0)
+        final_quant_meta["lambda_ab"] = float(args.lambda_ab)
+        metrics = weighted_objective(
+            w,
+            wq,
+            a,
+            b,
+            d,
+            wq_anchor=wq0,
+            lambda_q0=float(args.lambda_q0),
+            lambda_ab=float(args.lambda_ab),
+        )
 
         append_jsonl(
             metrics_path,
@@ -406,24 +470,41 @@ def optimize_layer(
                 "layer": key,
                 "outer": int(outer),
                 "phase": "alternating",
-                "objective_weighted": float(obj),
+                "objective_weighted": float(metrics["total"]),
+                "objective_weighted_recon": float(metrics["recon"]),
+                "objective_weighted_anchor": float(metrics["anchor"]),
+                "objective_weighted_ab_reg": float(metrics["ab_reg"]),
                 "bits": bits,
                 "group_size": gs,
                 "rank_ab": int(args.rank_ab),
                 "qtype": args.qtype,
+                "lambda_q0": float(args.lambda_q0),
+                "lambda_ab": float(args.lambda_ab),
             },
         )
 
-        if obj < best["objective"]:
+        if metrics["total"] < best["objective"]:
             best = {
-                "objective": float(obj),
+                "objective": float(metrics["total"]),
+                "objective_recon": float(metrics["recon"]),
+                "objective_anchor": float(metrics["anchor"]),
+                "objective_ab_reg": float(metrics["ab_reg"]),
                 "outer": int(outer),
                 "wdq": wq.detach().clone(),
                 "A": a.detach().clone(),
                 "B": b.detach().clone(),
             }
 
-    final_obj = weighted_objective(w, wq, a, b, d)
+    final_metrics = weighted_objective(
+        w,
+        wq,
+        a,
+        b,
+        d,
+        wq_anchor=wq0,
+        lambda_q0=float(args.lambda_q0),
+        lambda_ab=float(args.lambda_ab),
+    )
     return {
         "wdq": wq.detach().to(torch.float16).cpu(),
         "low_rank_ab": {
@@ -434,7 +515,12 @@ def optimize_layer(
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
-                "objective_weighted_final": float(final_obj),
+                "lambda_q0": float(args.lambda_q0),
+                "lambda_ab": float(args.lambda_ab),
+                "objective_weighted_final": float(final_metrics["total"]),
+                "objective_weighted_recon_final": float(final_metrics["recon"]),
+                "objective_weighted_anchor_final": float(final_metrics["anchor"]),
+                "objective_weighted_ab_reg_final": float(final_metrics["ab_reg"]),
             },
         },
         "wdq_best": best["wdq"].detach().to(torch.float16).cpu(),
@@ -446,8 +532,13 @@ def optimize_layer(
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
+                "lambda_q0": float(args.lambda_q0),
+                "lambda_ab": float(args.lambda_ab),
                 "best_outer": int(best["outer"]),
                 "objective_weighted_best": float(best["objective"]),
+                "objective_weighted_recon_best": float(best["objective_recon"]),
+                "objective_weighted_anchor_best": float(best["objective_anchor"]),
+                "objective_weighted_ab_reg_best": float(best["objective_ab_reg"]),
             },
         },
         "codebook": codebook.detach().to(torch.float16).cpu(),
@@ -458,15 +549,23 @@ def optimize_layer(
             "bits": bits,
             "group_size": gs,
             "init_source": init_source,
-            "objective_weighted_final": float(final_obj),
+            "lambda_q0": float(args.lambda_q0),
+            "lambda_ab": float(args.lambda_ab),
+            "objective_weighted_final": float(final_metrics["total"]),
+            "objective_weighted_recon_final": float(final_metrics["recon"]),
+            "objective_weighted_anchor_final": float(final_metrics["anchor"]),
+            "objective_weighted_ab_reg_final": float(final_metrics["ab_reg"]),
             "objective_weighted_best": float(best["objective"]),
+            "objective_weighted_recon_best": float(best["objective_recon"]),
+            "objective_weighted_anchor_best": float(best["objective_anchor"]),
+            "objective_weighted_ab_reg_best": float(best["objective_ab_reg"]),
             "best_outer": int(best["outer"]),
         },
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Alt Step3 - Alternating Lloyd-Max + Low-Rank Compensation")
+    ap = argparse.ArgumentParser("Alt Step3 1-bit - Regularized Alternating Lloyd-Max + Low-Rank Compensation")
     ap.add_argument("--model_id", required=True)
     ap.add_argument("--revision", default=None)
     ap.add_argument("--trust_remote_code", action="store_true")
@@ -484,6 +583,18 @@ def main() -> None:
     ap.add_argument("--outer_loops", type=int, default=4)
     ap.add_argument("--lloyd_iter", type=int, default=12)
     ap.add_argument("--chunk_groups", type=int, default=4096)
+    ap.add_argument(
+        "--lambda_q0",
+        type=float,
+        default=0.25,
+        help="Anchor strength for ||(Wq - Wq0)D||_F^2 in the Wq-step.",
+    )
+    ap.add_argument(
+        "--lambda_ab",
+        type=float,
+        default=0.01,
+        help="Regularization strength for ||AB D||_F^2 in the AB-step.",
+    )
     ap.add_argument("--clip_percentile", type=float, default=None)
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--layer_regex", type=str, default=None)
@@ -566,6 +677,8 @@ def main() -> None:
         "outer_loops": int(args.outer_loops),
         "lloyd_iter": int(args.lloyd_iter),
         "chunk_groups": int(args.chunk_groups),
+        "lambda_q0": float(args.lambda_q0),
+        "lambda_ab": float(args.lambda_ab),
         "clip_percentile_override": args.clip_percentile,
         "num_layers": len(layer_summaries),
         "objective_weighted_final_mean": float(final_mean),
@@ -627,6 +740,8 @@ class Step03AlternatingConfig:
     outer_loops: int = 4
     lloyd_iter: int = 12
     chunk_groups: int = 4096
+    lambda_q0: float = 0.25
+    lambda_ab: float = 0.01
     clip_percentile: Optional[float] = None
     eps: float = 1e-8
     layer_regex: Optional[str] = None
@@ -665,6 +780,10 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         str(int(cfg.lloyd_iter)),
         "--chunk_groups",
         str(int(cfg.chunk_groups)),
+        "--lambda_q0",
+        str(float(cfg.lambda_q0)),
+        "--lambda_ab",
+        str(float(cfg.lambda_ab)),
         "--eps",
         str(float(cfg.eps)),
         "--max_layers",

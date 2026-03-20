@@ -44,13 +44,13 @@ compare_residual_geometry_4way.py
   - summary.json
 
 예시:
-CUDA_VISIBLE_DEVICES=2 python test/compare_residual_geometry_4way.py \
+CUDA_VISIBLE_DEVICES=2 python test/fail/compare_residual_geometry_4way.py \
   --model_id meta-llama/Llama-3.1-8B \
-  --step1_dir_oas ./output/llama3_8b/step1_quant/1bit \
-  --step1_dir_second ./output/llama3_8b_64/step1_quant/1bit \
+  --step1_dir_oas ./output/llama3_8b/step1_quant/2bit \
+  --step1_dir_second ./output/llama3_8b_64/step1_quant/2bit \
   --calib_oas ./output/llama3_8b/calib_sqrtdiag.pt \
   --calib_second ./output/llama3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_8b_64/compare_4way/1bit \
+  --out_dir ./output/llama3_8b_64/compare_4way/2bit \
   --device cuda \
   --model_device_map auto \
   --dtype_w fp16 \

@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=3 nohup python step2_greedy_mc.py \
 
 Warmup(step2_1) 재사용하고 step2_2만 실행 : 
 CUDA_VISIBLE_DEVICES=3 nohup python step2_greedy_mc.py \
-  --model_id meta-llama/Llama-3.2-3B \
+  --model_id meta-llama/Llama-3.1-8B \
   --sens_csv ./output/llama_3_8/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
   --alpha_csv ./output/llama_3_8/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \
   --prebake_root ./output/llama_3_8/output_step0_prebake_alt \
@@ -34,7 +34,7 @@ CUDA_VISIBLE_DEVICES=3 nohup python step2_greedy_mc.py \
     --use_round_band \
   --skip_step2_1 \
   --resume \
-  --round_quantum 0.01 > ./logs/step2_mc_llama3_8b_25.log 2>&1 &
+  --round_quantum 0.1 > ./logs/step2_mc_llama3_8b_25.log 2>&1 &
 
 step2_1만 실행:
 CUDA_VISIBLE_DEVICES=0 python LABA/alt/step2_greedy_mc.py \
