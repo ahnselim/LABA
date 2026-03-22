@@ -19,11 +19,11 @@ Mixture step0 module: Step0-1 quantization (Lloyd-Max asym non-uniform baseline)
 
 CUDA_VISIBLE_DEVICES=1 \
 python step_1_quantize.py \
-  --model_id Qwen/Qwen3-8B \
+  --model_id meta-llama/Llama-3.2-3B \
   --bits 4 \
   --group_size 128 \
-  --calib_s_path ./output/qwen3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/qwen3_8b_64/step1_quant/4bit
+  --calib_s_path ./output/llama3_3b_64/calib_sqrtdiag.pt \
+  --out_dir ./output/llama3_3b_64/step1_quant/4bit
   
 """
 

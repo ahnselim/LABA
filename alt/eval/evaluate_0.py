@@ -18,8 +18,8 @@ This script converts those prebake shards back into:
   - low_rank_ab dict: { "<module>.weight": {"A": A, "B": B} }
 and reuses the existing joint eval utilities for injection + PPL.
 
-CUDA_VISIBLE_DEVICES=3 \
-python evaluate_0.py \
+CUDA_VISIBLE_DEVICES=2 \
+python eval/evaluate_0.py \
   --prebake_root ./output/llama_3_8/output_step0_prebake_alt \
   --model_name meta-llama/Llama-3.1-8B \
   --bits 1 \
@@ -42,7 +42,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 _THIS_DIR = Path(__file__).resolve().parent
-_STEP4_EVAL_PATH = _THIS_DIR / "step4_eval.py"
+_ALT_ROOT = _THIS_DIR.parent
+_STEP4_EVAL_PATH = _ALT_ROOT / "step4_eval.py"
 _STEP4_SPEC = importlib.util.spec_from_file_location("alt_step4_eval", _STEP4_EVAL_PATH)
 if _STEP4_SPEC is None or _STEP4_SPEC.loader is None:
     raise ImportError(f"Failed to load step4_eval module from {_STEP4_EVAL_PATH}")

@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Alternative Step3: LABA-style alternating Lloyd-Max + layerwise low-rank compensation.
+Alternative Step3 for 1-bit only: freeze Wq and refine low-rank factors with ridge ALS.
 
 Algorithm:
-  1) Initialize Wq^(0) with Lloyd-Max quantization.
-  2) Fit weighted rank-r low-rank factors on residual (W - Wq) D.
-  3) Alternate:
-       - AB update:  min || (W - Wq - AB) D ||_F^2
-       - Wq update:  min_{Wq in Q} || (W - AB - Wq) D ||_F^2
+  1) Initialize Wq^(0) from step1 artifact or by recomputing Lloyd-Max quantization.
+  2) Freeze Wq for the whole optimization.
+  3) Solve
+       min_{A,B} || (W - Wq - AB) D ||_F^2
+                 + lam_a ||A||_F^2 + lam_b ||BD||_F^2
+     with alternating ridge least squares.
 
 Outputs:
   - out_dir/wdq_star.pt
@@ -21,26 +22,30 @@ Outputs:
     - out_dir/qcodes_star.pt
     - out_dir/quant_meta_star.pt
     - out_dir/summary.json
- 
+
 CUDA_VISIBLE_DEVICES=1 nohup \
-python step_3_alternating.py \
+python step3_1bit_ridge.py \
   --model_id Qwen/Qwen3-8B \
-  --step1_dir ./output/qwen3_8b_64/step1_quant/4bit \
+  --step1_dir ./output/qwen3_8b_64/step1_quant/1bit \
   --calib_s ./output/qwen3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/qwen3_8b_64/step3_alt/4bit_50 \
+  --out_dir ./output/qwen3_8b_64//step3_1bit_ridge \
   --qtype hessian-aware \
   --rank_ab 64 \
-  --outer_loops 50 > ./logs/qwen3_8b_3bit_50.log 2>&1 &
-  
-CUDA_VISIBLE_DEVICES=2 nohup \
-python step_3_alternating.py \
-  --model_id meta-llama/Llama-3.2-3B \
-  --step1_dir ./output/llama3_3b_64/step1_quant/4bit \
-  --calib_s ./output/llama3_3b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/llama3_3b_64/step3_alt/4bit_50 \
+  --outer_loops 10 \
+  --lam_a 1e-4 \
+  --lam_b 1e-4 > ./logs/qwen3_8b_ridge_1bit.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 nohup \
+python step3_1bit_ridge.py \
+  --model_id meta-llama/Llama-3.1-8B \
+  --step1_dir ./output/llama3_8b_64/step1_quant/1bit \
+  --calib_s ./output/llama3_8b_64/calib_sqrtdiag.pt \
+  --out_dir ./output/llama3_8b_64/step3_1bit_ridge \
   --qtype hessian-aware \
   --rank_ab 64 \
-  --outer_loops 50 > ./logs/llama3_3b_4bit_50.log 2>&1 &
+  --outer_loops 10 \
+  --lam_a 1e-4 \
+  --lam_b 1e-4 > ./logs/llama3_8b_ridge_1bit.log 2>&1 &
 
 """
 
@@ -49,7 +54,6 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import random
 import re
 import subprocess
@@ -182,6 +186,50 @@ def weighted_low_rank_fit(
 
 
 @torch.no_grad()
+def weighted_ridge_ab_als(
+    residual: torch.Tensor,
+    diag_weight: torch.Tensor,
+    rank: int,
+    eps: float,
+    n_iters: int,
+    lam_a: float,
+    lam_b: float,
+    metrics_cb=None,
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    d = diag_weight.to(device=residual.device, dtype=torch.float32)
+    rp = residual.to(torch.float32) * d.unsqueeze(0)
+
+    a, bp = rank_r_svd(rp, r=int(rank))
+    r_eff = int(a.shape[1])
+    eye = torch.eye(r_eff, device=rp.device, dtype=rp.dtype)
+
+    inv_d = 1.0 / d.clamp_min(float(eps))
+    b = bp * inv_d.unsqueeze(0)
+    if metrics_cb is not None:
+        metrics_cb(-1, a, b)
+
+    for it in range(int(n_iters)):
+        cross_rb = rp @ bp.T
+        gram_b = bp @ bp.T
+        a = torch.linalg.solve(gram_b + float(lam_a) * eye, cross_rb.T).T
+
+        cross_ar = a.T @ rp
+        gram_a = a.T @ a
+        bp = torch.linalg.solve(gram_a + float(lam_b) * eye, cross_ar)
+
+        b = bp * inv_d.unsqueeze(0)
+        if metrics_cb is not None:
+            metrics_cb(it, a, b)
+
+    return a, b, {
+        "rank_effective": r_eff,
+        "iters": int(n_iters),
+        "lam_a": float(lam_a),
+        "lam_b": float(lam_b),
+    }
+
+
+@torch.no_grad()
 def weighted_objective(
     w: torch.Tensor,
     wq: torch.Tensor,
@@ -215,12 +263,12 @@ def load_context(args: argparse.Namespace) -> dict:
     if not (codebook_path.exists() and qcodes_path.exists() and meta_path.exists()):
         raise FileNotFoundError("step1_dir must contain codebook.pt, qcodes.pt, meta.pt")
 
-    print(f"[Alt-Step3] loading step1 artifacts: {step1_dir}", flush=True)
+    print(f"[Step3-1bit-Ridge] loading step1 artifacts: {step1_dir}", flush=True)
     codebooks: Dict[str, torch.Tensor] = torch.load(codebook_path, map_location="cpu")
     qcodes: Dict[str, torch.Tensor] = torch.load(qcodes_path, map_location="cpu")
     metas: Dict[str, dict] = torch.load(meta_path, map_location="cpu")
 
-    print(f"[Alt-Step3] loading calib_s: {args.calib_s}", flush=True)
+    print(f"[Step3-1bit-Ridge] loading calib_s: {args.calib_s}", flush=True)
     calib_s: Dict[str, dict] = torch.load(args.calib_s, map_location="cpu")
 
     if args.dtype_w == "fp16":
@@ -235,9 +283,10 @@ def load_context(args: argparse.Namespace) -> dict:
     resolved_model_device_map = None if dm_raw in {"", "none", "null"} else args.model_device_map
 
     print(
-        f"[Alt-Step3] loading original model: {args.model_id} "
-        f"(device_map={resolved_model_device_map}, device={device})"
-    , flush=True)
+        f"[Step3-1bit-Ridge] loading original model: {args.model_id} "
+        f"(device_map={resolved_model_device_map}, device={device})",
+        flush=True,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         revision=args.revision,
@@ -252,7 +301,11 @@ def load_context(args: argparse.Namespace) -> dict:
     except NotImplementedError:
         if resolved_model_device_map is None:
             raise
-        print("[Alt-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.", flush=True)
+        print(
+            "[Step3-1bit-Ridge] Detected meta tensors under device_map mode. "
+            "Re-loading on CPU to build state snapshot.",
+            flush=True,
+        )
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -282,15 +335,19 @@ def load_context(args: argparse.Namespace) -> dict:
             continue
         if layer_re and not layer_re.search(key):
             continue
+        if int(metas[key]["bits"]) != 1:
+            raise RuntimeError(
+                f"step3_1bit_ridge.py is 1-bit only, but layer {key} has bits={int(metas[key]['bits'])}"
+            )
         keys.append(key)
 
     keys = sorted(keys, key=sort_key)
     if args.max_layers > 0:
         keys = keys[: int(args.max_layers)]
     if not keys:
-        raise RuntimeError("No matched layers found.")
+        raise RuntimeError("No matched 1-bit layers found.")
 
-    print(f"[Alt-Step3] matched layers: {len(keys)}", flush=True)
+    print(f"[Step3-1bit-Ridge] matched layers: {len(keys)}", flush=True)
     return {
         "device": device,
         "codebooks": codebooks,
@@ -317,6 +374,8 @@ def optimize_layer(
 
     meta = metas[key]
     bits = int(meta["bits"])
+    if bits != 1:
+        raise RuntimeError(f"{key} has bits={bits}, but this script only supports 1-bit")
     gs = int(meta["group_size"])
     orig_i = int(tuple(meta["orig_shape"])[1])
     clip_pct = float(meta.get("clip_percentile", 0.0) if args.clip_percentile is None else args.clip_percentile)
@@ -349,15 +408,16 @@ def optimize_layer(
         )
         init_source = "recomputed"
 
-    a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
-    obj = weighted_objective(w, wq, a, b, d)
+    residual = w - wq
+    init_a, init_b = weighted_low_rank_fit(residual, d, rank=int(args.rank_ab), eps=float(args.eps))
+    init_obj = weighted_objective(w, wq, init_a, init_b, d)
 
     best = {
-        "objective": float(obj),
+        "objective": float(init_obj),
         "outer": -1,
         "wdq": wq.detach().clone(),
-        "A": a.detach().clone(),
-        "B": b.detach().clone(),
+        "A": init_a.detach().clone(),
+        "B": init_b.detach().clone(),
     }
 
     append_jsonl(
@@ -365,15 +425,59 @@ def optimize_layer(
         {
             "layer": key,
             "outer": -1,
-            "phase": "init",
-            "objective_weighted": float(obj),
+            "phase": "init_svd",
+            "objective_weighted": float(init_obj),
             "bits": bits,
             "group_size": gs,
             "rank_ab": int(args.rank_ab),
             "qtype": args.qtype,
             "init_source": init_source,
+            "lam_a": float(args.lam_a),
+            "lam_b": float(args.lam_b),
+            "wq_frozen": True,
         },
     )
+
+    def _record_iter(step_idx: int, a_cur: torch.Tensor, b_cur: torch.Tensor) -> None:
+        nonlocal best
+        obj = weighted_objective(w, wq, a_cur, b_cur, d)
+        phase = "als_init" if step_idx < 0 else "als"
+        append_jsonl(
+            metrics_path,
+            {
+                "layer": key,
+                "outer": int(step_idx),
+                "phase": phase,
+                "objective_weighted": float(obj),
+                "bits": bits,
+                "group_size": gs,
+                "rank_ab": int(args.rank_ab),
+                "qtype": args.qtype,
+                "lam_a": float(args.lam_a),
+                "lam_b": float(args.lam_b),
+                "wq_frozen": True,
+            },
+        )
+        if obj < best["objective"]:
+            best = {
+                "objective": float(obj),
+                "outer": int(step_idx),
+                "wdq": wq.detach().clone(),
+                "A": a_cur.detach().clone(),
+                "B": b_cur.detach().clone(),
+            }
+
+    a, b, als_meta = weighted_ridge_ab_als(
+        residual=residual,
+        diag_weight=d,
+        rank=int(args.rank_ab),
+        eps=float(args.eps),
+        n_iters=int(args.outer_loops),
+        lam_a=float(args.lam_a),
+        lam_b=float(args.lam_b),
+        metrics_cb=_record_iter,
+    )
+    final_obj = weighted_objective(w, wq, a, b, d)
 
     final_quant_meta = {
         "bits": bits,
@@ -381,49 +485,13 @@ def optimize_layer(
         "clip_percentile": float(clip_pct),
         "qtype": str(args.qtype),
         "init_source": str(init_source),
+        "wq_frozen": True,
+        "solver": "ridge_als_ab",
+        "lam_a": float(args.lam_a),
+        "lam_b": float(args.lam_b),
+        "als_iters": int(args.outer_loops),
     }
 
-    for outer in range(int(args.outer_loops)):
-        a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
-        target = w - (a @ b)
-        wq, codebook, qcodes, quant_meta = lloyd_asym_nonuniform_quantize(
-            target,
-            b=bits,
-            group_size=gs,
-            clip_pct=clip_pct,
-            lloyd_iter=int(args.lloyd_iter),
-            chunk_groups=int(args.chunk_groups),
-            hessian_diag=hdiag,
-        )
-        final_quant_meta = dict(quant_meta)
-        final_quant_meta["qtype"] = str(args.qtype)
-        final_quant_meta["clip_percentile"] = float(clip_pct)
-        obj = weighted_objective(w, wq, a, b, d)
-
-        append_jsonl(
-            metrics_path,
-            {
-                "layer": key,
-                "outer": int(outer),
-                "phase": "alternating",
-                "objective_weighted": float(obj),
-                "bits": bits,
-                "group_size": gs,
-                "rank_ab": int(args.rank_ab),
-                "qtype": args.qtype,
-            },
-        )
-
-        if obj < best["objective"]:
-            best = {
-                "objective": float(obj),
-                "outer": int(outer),
-                "wdq": wq.detach().clone(),
-                "A": a.detach().clone(),
-                "B": b.detach().clone(),
-            }
-
-    final_obj = weighted_objective(w, wq, a, b, d)
     return {
         "wdq": wq.detach().to(torch.float16).cpu(),
         "low_rank_ab": {
@@ -431,10 +499,15 @@ def optimize_layer(
             "B": b.detach().to(torch.float16).cpu(),
             "meta": {
                 "rank": int(args.rank_ab),
+                "rank_effective": int(als_meta["rank_effective"]),
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
                 "objective_weighted_final": float(final_obj),
+                "lam_a": float(args.lam_a),
+                "lam_b": float(args.lam_b),
+                "wq_frozen": True,
+                "solver": "ridge_als_ab",
             },
         },
         "wdq_best": best["wdq"].detach().to(torch.float16).cpu(),
@@ -443,11 +516,16 @@ def optimize_layer(
             "B": best["B"].detach().to(torch.float16).cpu(),
             "meta": {
                 "rank": int(args.rank_ab),
+                "rank_effective": int(als_meta["rank_effective"]),
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
                 "best_outer": int(best["outer"]),
                 "objective_weighted_best": float(best["objective"]),
+                "lam_a": float(args.lam_a),
+                "lam_b": float(args.lam_b),
+                "wq_frozen": True,
+                "solver": "ridge_als_ab",
             },
         },
         "codebook": codebook.detach().to(torch.float16).cpu(),
@@ -461,12 +539,15 @@ def optimize_layer(
             "objective_weighted_final": float(final_obj),
             "objective_weighted_best": float(best["objective"]),
             "best_outer": int(best["outer"]),
+            "lam_a": float(args.lam_a),
+            "lam_b": float(args.lam_b),
+            "wq_frozen": True,
         },
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Alt Step3 - Alternating Lloyd-Max + Low-Rank Compensation")
+    ap = argparse.ArgumentParser("Step3 1-bit Ridge ALS - Freeze Wq, Alternate A/B")
     ap.add_argument("--model_id", required=True)
     ap.add_argument("--revision", default=None)
     ap.add_argument("--trust_remote_code", action="store_true")
@@ -481,11 +562,13 @@ def main() -> None:
 
     ap.add_argument("--qtype", default="hessian-aware", choices=["plain", "hessian-aware"])
     ap.add_argument("--rank_ab", type=int, default=64)
-    ap.add_argument("--outer_loops", type=int, default=4)
+    ap.add_argument("--outer_loops", type=int, default=10, help="Number of A/B ridge-ALS iterations")
     ap.add_argument("--lloyd_iter", type=int, default=12)
     ap.add_argument("--chunk_groups", type=int, default=4096)
     ap.add_argument("--clip_percentile", type=float, default=None)
     ap.add_argument("--eps", type=float, default=1e-8)
+    ap.add_argument("--lam_a", type=float, default=1e-4)
+    ap.add_argument("--lam_b", type=float, default=1e-4)
     ap.add_argument("--layer_regex", type=str, default=None)
     ap.add_argument("--max_layers", type=int, default=0)
     ap.add_argument("--save_every_layer", action="store_true")
@@ -518,7 +601,7 @@ def main() -> None:
 
     t0 = time.time()
     for idx, key in enumerate(ctx["keys"], start=1):
-        print(f"[Alt-Step3] ({idx}/{len(ctx['keys'])}) optimizing: {key}", flush=True)
+        print(f"[Step3-1bit-Ridge] ({idx}/{len(ctx['keys'])}) optimizing: {key}", flush=True)
         layer_res = optimize_layer(key=key, ctx=ctx, args=args, metrics_path=metrics_path)
         wdq_out[key] = layer_res["wdq"]
         ab_out[key] = layer_res["low_rank_ab"]
@@ -567,6 +650,8 @@ def main() -> None:
         "lloyd_iter": int(args.lloyd_iter),
         "chunk_groups": int(args.chunk_groups),
         "clip_percentile_override": args.clip_percentile,
+        "lam_a": float(args.lam_a),
+        "lam_b": float(args.lam_b),
         "num_layers": len(layer_summaries),
         "objective_weighted_final_mean": float(final_mean),
         "objective_weighted_best_mean": float(best_mean),
@@ -577,7 +662,7 @@ def main() -> None:
         with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("[Alt-Step3] saved:", flush=True)
+    print("[Step3-1bit-Ridge] saved:", flush=True)
     print(f"  wdq*: {out_dir / 'wdq_star.pt'}", flush=True)
     print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}", flush=True)
     if args.save_all:
@@ -612,7 +697,7 @@ def _invoke_local_main(argv: Sequence[str]) -> subprocess.CompletedProcess:
 
 
 @dataclass
-class Step03AlternatingConfig:
+class Step31BitRidgeConfig:
     model_id: str
     step1_dir: str
     calib_s: str
@@ -624,20 +709,23 @@ class Step03AlternatingConfig:
     dtype_w: str = "fp16"
     qtype: str = "hessian-aware"
     rank_ab: int = 64
-    outer_loops: int = 4
+    outer_loops: int = 10
     lloyd_iter: int = 12
     chunk_groups: int = 4096
     clip_percentile: Optional[float] = None
     eps: float = 1e-8
+    lam_a: float = 1e-4
+    lam_b: float = 1e-4
     layer_regex: Optional[str] = None
     max_layers: int = 0
     save_every_layer: bool = False
+    save_all: bool = False
     seed: int = 42
     python_exe: str = sys.executable
     source_script: str = str(Path(__file__).resolve())
 
 
-def build_command(cfg: Step03AlternatingConfig) -> List[str]:
+def build_command(cfg: Step31BitRidgeConfig) -> List[str]:
     cmd: List[str] = [
         str(cfg.python_exe),
         str(cfg.source_script),
@@ -667,6 +755,10 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         str(int(cfg.chunk_groups)),
         "--eps",
         str(float(cfg.eps)),
+        "--lam_a",
+        str(float(cfg.lam_a)),
+        "--lam_b",
+        str(float(cfg.lam_b)),
         "--max_layers",
         str(int(cfg.max_layers)),
         "--seed",
@@ -682,10 +774,12 @@ def build_command(cfg: Step03AlternatingConfig) -> List[str]:
         cmd += ["--layer_regex", str(cfg.layer_regex)]
     if cfg.save_every_layer:
         cmd.append("--save_every_layer")
+    if cfg.save_all:
+        cmd.append("--save_all")
     return cmd
 
 
-def run(cfg: Step03AlternatingConfig, check: bool = True) -> subprocess.CompletedProcess:
+def run(cfg: Step31BitRidgeConfig, check: bool = True) -> subprocess.CompletedProcess:
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
     cp = _invoke_local_main(build_command(cfg)[2:])
     if check and cp.returncode != 0:

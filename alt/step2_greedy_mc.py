@@ -10,7 +10,7 @@ step2_1 artifacts into step2_2 automatically.
 기본값으로 init seed(`init_assign_csv`)를 `cvx/step1_3c_opt.py`로 자동 생성한다.
 
 기본 사용 (step2_1 + step2_2 연속 실행):
-CUDA_VISIBLE_DEVICES=3 nohup python step2_greedy_mc.py \
+CUDA_VISIBLE_DEVICES=2 nohup python step2_greedy_mc.py \
   --model_id meta-llama/Llama-3.1-8B \
   --sens_csv ./output/llama_3_8/output_step1_greedy/step1_1/layerwise_sensitivity.csv \
   --alpha_csv ./output/llama_3_8/output_step1_greedy/step1_2/alpha_layerwise_prebake.csv \

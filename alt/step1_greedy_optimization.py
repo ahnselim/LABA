@@ -21,7 +21,7 @@ unset TRANSFORMERS_CACHE
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-CUDA_VISIBLE_DEVICES=3,1,2 nohup \
+CUDA_VISIBLE_DEVICES=0,1,2 nohup \
 python step1_greedy_optimization.py \
   --model_id meta-llama/Llama-3.1-8B \
   --step0_out_root ./output/llama_3_8/output_step0_prebake_alt \

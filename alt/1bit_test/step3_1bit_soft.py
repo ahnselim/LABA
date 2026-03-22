@@ -1,15 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Alternative Step3 for 1-bit only: freeze Wq and refine low-rank factors with ridge ALS.
+Alternative Step3 for 1-bit LABA: alternating low-rank compensation + soft assignment refinement.
 
 Algorithm:
-  1) Initialize Wq^(0) from step1 artifact or by recomputing Lloyd-Max quantization.
-  2) Freeze Wq for the whole optimization.
-  3) Solve
-       min_{A,B} || (W - Wq - AB) D ||_F^2
-                 + lam_a ||A||_F^2 + lam_b ||BD||_F^2
-     with alternating ridge least squares.
+  1) Initialize 1-bit Wq^(0) from step1 artifacts or a fresh Lloyd-Max pass.
+  2) Fit weighted rank-r low-rank factors on residual (W - Wq) D.
+  3) Alternate:
+       - AB update:  min || (W - Wq - AB) D ||_F^2
+       - Wq update:  target = W - AB
+                     refine 1-bit assignments with soft logits and group-wise affine
+                     alpha/beta parameters, then hard-project back to true 1-bit codes
+
+This script is 1-bit only. The Wq step uses soft assignment refinement instead of
+re-running Lloyd quantization inside the outer loop, and re-fits AB after each Wq
+update so the saved pair stays consistent.
 
 Outputs:
   - out_dir/wdq_star.pt
@@ -23,18 +28,34 @@ Outputs:
     - out_dir/quant_meta_star.pt
     - out_dir/summary.json
 
-CUDA_VISIBLE_DEVICES=1 nohup \
-python step3_1bit_ridge.py \
-  --model_id Qwen/Qwen3-8B \
-  --step1_dir ./output/qwen3_8b_64/step1_quant/1bit \
-  --calib_s ./output/qwen3_8b_64/calib_sqrtdiag.pt \
-  --out_dir ./output/qwen3_8b_64//step3_1bit_ridge \
-  --qtype hessian-aware \
-  --rank_ab 64 \
-  --outer_loops 10 \
-  --lam_a 1e-4 \
-  --lam_b 1e-4 > ./logs/qwen3_8b_ridge_1bit.log 2>&1 &
+Usage:
+  CUDA_VISIBLE_DEVICES=2 nohup \
+  python 1bit_test/step3_1bit_soft.py \
+    --model_id meta-llama/Llama-3.1-8B \
+    --step1_dir ./output/llama3_8b_64/step1_quant/1bit \
+    --calib_s ./output/llama3_8b_64/calib_sqrtdiag.pt \
+    --out_dir ./output/llama3_8b_64/step3_soft/1bit \
+    --qtype hessian-aware \
+    --rank_ab 64 \
+    --outer_loops 10 \
+    --soft_steps 25 \
+    --soft_lr 1e-1 \
+    --soft_scale_lr 5e-2 \
+    --soft_tau 1.0 > ./logs/llama3_8b_soft_1bit.log 2>&1 &
 
+  CUDA_VISIBLE_DEVICES=0 nohup \
+  python 1bit_test/step3_1bit_soft.py \
+    --model_id Qwen/Qwen3-8B \
+    --step1_dir ./output/qwen3_8b_64/step1_quant/1bit \
+    --calib_s ./output/qwen3_8b_64/calib_sqrtdiag.pt \
+    --out_dir ./output/qwen3_8b_64/step3_soft/1bit \
+    --qtype hessian-aware \
+    --rank_ab 64 \
+    --outer_loops 10 \
+    --soft_steps 25 \
+    --soft_lr 1e-1 \
+    --soft_scale_lr 5e-2 \
+    --soft_tau 1.0 > ./logs/qwen3_8b_soft_1bit.log 2>&1 &
 """
 
 from __future__ import annotations
@@ -42,6 +63,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import random
 import re
 import subprocess
@@ -59,8 +81,10 @@ except Exception as e:
     raise RuntimeError("transformers가 필요합니다: pip install transformers") from e
 
 _THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
+_PARENT_DIR = _THIS_DIR.parent
+for _path in (str(_THIS_DIR), str(_PARENT_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from step_1_quantize import (  # noqa: E402
     _snapshot_state_to_cpu,
@@ -121,6 +145,145 @@ def dequant_from_codebook_codes(
     return xq.reshape(o, g * s)[:, :orig_i]
 
 
+def _reshape_weight_to_groups(
+    weight_oi: torch.Tensor,
+    num_groups: int,
+    group_span: int,
+) -> Tuple[torch.Tensor, int]:
+    o, orig_i = weight_oi.shape
+    total_i = int(num_groups) * int(group_span)
+    pad = total_i - orig_i
+    if pad < 0:
+        raise ValueError(f"invalid grouped shape: total_i={total_i} < orig_i={orig_i}")
+    if pad > 0:
+        pad_block = torch.zeros((o, pad), device=weight_oi.device, dtype=weight_oi.dtype)
+        weight_oi = torch.cat([weight_oi, pad_block], dim=1)
+    return weight_oi.reshape(o, num_groups, group_span), pad
+
+
+def _reshape_diag_to_groups(
+    diag_weight_i: torch.Tensor,
+    num_groups: int,
+    group_span: int,
+) -> torch.Tensor:
+    orig_i = int(diag_weight_i.numel())
+    total_i = int(num_groups) * int(group_span)
+    pad = total_i - orig_i
+    if pad < 0:
+        raise ValueError(f"invalid grouped shape: total_i={total_i} < orig_i={orig_i}")
+    if pad > 0:
+        diag_weight_i = torch.cat(
+            [diag_weight_i, torch.zeros(pad, device=diag_weight_i.device, dtype=diag_weight_i.dtype)],
+            dim=0,
+        )
+    return diag_weight_i.reshape(1, num_groups, group_span)
+
+
+def soft_refine_then_project(
+    target: torch.Tensor,
+    init_codebook: torch.Tensor,
+    init_qcodes: torch.Tensor,
+    diag_weight: torch.Tensor,
+    soft_steps: int,
+    soft_lr: float,
+    soft_tau: float,
+    init_logit_abs: float,
+    logit_clip: float,
+    scale_lr: float,
+    allow_codebook_update: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    if init_codebook.shape[-1] != 2:
+        raise ValueError(f"soft_refine_then_project expects 1-bit codebook, got {tuple(init_codebook.shape)}")
+
+    device = target.device
+    target = target.to(dtype=torch.float32)
+    codebook = init_codebook.detach().to(device=device, dtype=torch.float32)
+    qcodes = init_qcodes.detach().to(device=device, dtype=torch.long)
+    d = diag_weight.detach().to(device=device, dtype=torch.float32)
+
+    o, g, s = qcodes.shape
+    if codebook.shape[:2] != (o, g):
+        raise ValueError(
+            f"codebook/qcodes shape mismatch: codebook={tuple(codebook.shape)}, qcodes={tuple(qcodes.shape)}"
+        )
+
+    target_g, pad = _reshape_weight_to_groups(target, num_groups=g, group_span=s)
+    d_g = _reshape_diag_to_groups(d, num_groups=g, group_span=s)
+
+    c0 = codebook[..., 0].unsqueeze(-1)
+    c1 = codebook[..., 1].unsqueeze(-1)
+    beta_init = 0.5 * (c0 + c1)
+    alpha_init = 0.5 * (c0 - c1)
+    logits = torch.where(
+        qcodes == 0,
+        torch.full_like(qcodes, float(init_logit_abs), dtype=torch.float32),
+        torch.full_like(qcodes, -float(init_logit_abs), dtype=torch.float32),
+    ).to(device=device)
+    logits.requires_grad_(True)
+    if allow_codebook_update:
+        alpha = alpha_init.clone().requires_grad_(True)
+        beta = beta_init.clone().requires_grad_(True)
+        optimizer = torch.optim.Adam(
+            [
+                {"params": [logits], "lr": float(soft_lr)},
+                {"params": [alpha, beta], "lr": float(scale_lr)},
+            ]
+        )
+    else:
+        alpha = alpha_init
+        beta = beta_init
+        optimizer = torch.optim.Adam([{"params": [logits], "lr": float(soft_lr)}])
+    tau = float(max(soft_tau, 1e-6))
+    clip_value = float(max(logit_clip, init_logit_abs))
+
+    for _ in range(int(soft_steps)):
+        optimizer.zero_grad(set_to_none=True)
+        probs_code0 = torch.sigmoid(logits / tau)
+        soft_sign = 2.0 * probs_code0 - 1.0
+        wq_soft_g = beta + alpha * soft_sign
+        err = (target_g - wq_soft_g) * d_g
+        loss = (err * err).mean()
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            logits.clamp_(-clip_value, clip_value)
+
+    with torch.no_grad():
+        probs_code0 = torch.sigmoid(logits / tau)
+        qcodes_new = (probs_code0 < 0.5).to(torch.uint8)
+        if allow_codebook_update:
+            codebook_new = torch.stack(
+                [
+                    (beta + alpha).squeeze(-1),
+                    (beta - alpha).squeeze(-1),
+                ],
+                dim=-1,
+            )
+        else:
+            codebook_new = codebook
+        wq_hard = dequant_from_codebook_codes(codebook_new, qcodes_new, orig_i=target.shape[1])
+
+    meta = {
+        'bits': 1,
+        'group_size': int(s),
+        'levels': 2,
+        'orig_shape': (int(target.shape[0]), int(target.shape[1])),
+        'O': int(o),
+        'G': int(g),
+        'S': int(s),
+        'pad': int(pad),
+        'soft_steps': int(soft_steps),
+        'soft_lr': float(soft_lr),
+        'soft_scale_lr': float(scale_lr),
+        'soft_tau': float(soft_tau),
+        'soft_init_logit_abs': float(init_logit_abs),
+        'soft_logit_clip': float(logit_clip),
+        'soft_centroids_fixed': not bool(allow_codebook_update),
+        'soft_parameterization': 'groupwise_affine_sign',
+    }
+    return wq_hard, codebook_new, qcodes_new, meta
+
+
 @torch.no_grad()
 def rank_r_svd(m: torch.Tensor, r: int) -> Tuple[torch.Tensor, torch.Tensor]:
     o, i = m.shape
@@ -174,50 +337,6 @@ def weighted_low_rank_fit(
 
 
 @torch.no_grad()
-def weighted_ridge_ab_als(
-    residual: torch.Tensor,
-    diag_weight: torch.Tensor,
-    rank: int,
-    eps: float,
-    n_iters: int,
-    lam_a: float,
-    lam_b: float,
-    metrics_cb=None,
-) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-    d = diag_weight.to(device=residual.device, dtype=torch.float32)
-    rp = residual.to(torch.float32) * d.unsqueeze(0)
-
-    a, bp = rank_r_svd(rp, r=int(rank))
-    r_eff = int(a.shape[1])
-    eye = torch.eye(r_eff, device=rp.device, dtype=rp.dtype)
-
-    inv_d = 1.0 / d.clamp_min(float(eps))
-    b = bp * inv_d.unsqueeze(0)
-    if metrics_cb is not None:
-        metrics_cb(-1, a, b)
-
-    for it in range(int(n_iters)):
-        cross_rb = rp @ bp.T
-        gram_b = bp @ bp.T
-        a = torch.linalg.solve(gram_b + float(lam_a) * eye, cross_rb.T).T
-
-        cross_ar = a.T @ rp
-        gram_a = a.T @ a
-        bp = torch.linalg.solve(gram_a + float(lam_b) * eye, cross_ar)
-
-        b = bp * inv_d.unsqueeze(0)
-        if metrics_cb is not None:
-            metrics_cb(it, a, b)
-
-    return a, b, {
-        "rank_effective": r_eff,
-        "iters": int(n_iters),
-        "lam_a": float(lam_a),
-        "lam_b": float(lam_b),
-    }
-
-
-@torch.no_grad()
 def weighted_objective(
     w: torch.Tensor,
     wq: torch.Tensor,
@@ -243,6 +362,26 @@ def should_reuse_step1_init(meta: dict, qtype: str) -> bool:
     return not weighted
 
 
+def build_step1_svd_baseline(
+    w: torch.Tensor,
+    d: torch.Tensor,
+    codebook: torch.Tensor,
+    qcodes: torch.Tensor,
+    orig_i: int,
+    rank_ab: int,
+    eps: float,
+) -> Dict[str, torch.Tensor | float]:
+    wq = dequant_from_codebook_codes(codebook, qcodes, orig_i=orig_i)
+    a, b = weighted_low_rank_fit(w - wq, d, rank=int(rank_ab), eps=float(eps))
+    obj = weighted_objective(w, wq, a, b, d)
+    return {
+        "wq": wq.detach().clone(),
+        "A": a.detach().clone(),
+        "B": b.detach().clone(),
+        "objective": float(obj),
+    }
+
+
 def load_context(args: argparse.Namespace) -> dict:
     step1_dir = Path(args.step1_dir).resolve()
     codebook_path = step1_dir / "codebook.pt"
@@ -251,12 +390,12 @@ def load_context(args: argparse.Namespace) -> dict:
     if not (codebook_path.exists() and qcodes_path.exists() and meta_path.exists()):
         raise FileNotFoundError("step1_dir must contain codebook.pt, qcodes.pt, meta.pt")
 
-    print(f"[Step3-1bit-Ridge] loading step1 artifacts: {step1_dir}", flush=True)
+    print(f"[Alt-Step3] loading step1 artifacts: {step1_dir}", flush=True)
     codebooks: Dict[str, torch.Tensor] = torch.load(codebook_path, map_location="cpu")
     qcodes: Dict[str, torch.Tensor] = torch.load(qcodes_path, map_location="cpu")
     metas: Dict[str, dict] = torch.load(meta_path, map_location="cpu")
 
-    print(f"[Step3-1bit-Ridge] loading calib_s: {args.calib_s}", flush=True)
+    print(f"[Alt-Step3] loading calib_s: {args.calib_s}", flush=True)
     calib_s: Dict[str, dict] = torch.load(args.calib_s, map_location="cpu")
 
     if args.dtype_w == "fp16":
@@ -271,10 +410,9 @@ def load_context(args: argparse.Namespace) -> dict:
     resolved_model_device_map = None if dm_raw in {"", "none", "null"} else args.model_device_map
 
     print(
-        f"[Step3-1bit-Ridge] loading original model: {args.model_id} "
-        f"(device_map={resolved_model_device_map}, device={device})",
-        flush=True,
-    )
+        f"[Alt-Step3] loading original model: {args.model_id} "
+        f"(device_map={resolved_model_device_map}, device={device})"
+    , flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         revision=args.revision,
@@ -289,11 +427,7 @@ def load_context(args: argparse.Namespace) -> dict:
     except NotImplementedError:
         if resolved_model_device_map is None:
             raise
-        print(
-            "[Step3-1bit-Ridge] Detected meta tensors under device_map mode. "
-            "Re-loading on CPU to build state snapshot.",
-            flush=True,
-        )
+        print("[Alt-Step3] Detected meta tensors under device_map mode. Re-loading on CPU to build state snapshot.", flush=True)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -323,19 +457,15 @@ def load_context(args: argparse.Namespace) -> dict:
             continue
         if layer_re and not layer_re.search(key):
             continue
-        if int(metas[key]["bits"]) != 1:
-            raise RuntimeError(
-                f"step3_1bit_ridge.py is 1-bit only, but layer {key} has bits={int(metas[key]['bits'])}"
-            )
         keys.append(key)
 
     keys = sorted(keys, key=sort_key)
     if args.max_layers > 0:
         keys = keys[: int(args.max_layers)]
     if not keys:
-        raise RuntimeError("No matched 1-bit layers found.")
+        raise RuntimeError("No matched layers found.")
 
-    print(f"[Step3-1bit-Ridge] matched layers: {len(keys)}", flush=True)
+    print(f"[Alt-Step3] matched layers: {len(keys)}", flush=True)
     return {
         "device": device,
         "codebooks": codebooks,
@@ -362,11 +492,11 @@ def optimize_layer(
 
     meta = metas[key]
     bits = int(meta["bits"])
-    if bits != 1:
-        raise RuntimeError(f"{key} has bits={bits}, but this script only supports 1-bit")
     gs = int(meta["group_size"])
     orig_i = int(tuple(meta["orig_shape"])[1])
     clip_pct = float(meta.get("clip_percentile", 0.0) if args.clip_percentile is None else args.clip_percentile)
+    if bits != 1:
+        raise ValueError(f"{Path(__file__).name} only supports 1-bit artifacts, but {key} has bits={bits}")
 
     w_cpu = state[key].to(torch.float32)
     d_cpu = load_diag_weight(calib_s[key], eps=float(args.eps))
@@ -378,11 +508,22 @@ def optimize_layer(
     w = w_cpu.to(device)
     d = d_cpu.to(device)
     hdiag = (d * d) if args.qtype == "hessian-aware" else None
+    step1_codebook = codebooks[key].to(device=device, dtype=torch.float32)
+    step1_qcodes = qcodes_dict[key].to(device=device)
+    step1_baseline = build_step1_svd_baseline(
+        w=w,
+        d=d,
+        codebook=step1_codebook,
+        qcodes=step1_qcodes,
+        orig_i=orig_i,
+        rank_ab=int(args.rank_ab),
+        eps=float(args.eps),
+    )
 
     if should_reuse_step1_init(meta, args.qtype):
-        codebook = codebooks[key].to(device=device, dtype=torch.float32)
-        qcodes = qcodes_dict[key].to(device=device)
-        wq = dequant_from_codebook_codes(codebook, qcodes, orig_i=orig_i)
+        codebook = step1_codebook
+        qcodes = step1_qcodes
+        wq = step1_baseline["wq"]
         init_source = "step1_artifact"
     else:
         wq, codebook, qcodes, _ = lloyd_asym_nonuniform_quantize(
@@ -396,16 +537,12 @@ def optimize_layer(
         )
         init_source = "recomputed"
 
-    residual = w - wq
-    init_a, init_b = weighted_low_rank_fit(residual, d, rank=int(args.rank_ab), eps=float(args.eps))
-    init_obj = weighted_objective(w, wq, init_a, init_b, d)
-
     best = {
-        "objective": float(init_obj),
+        "objective": float(step1_baseline["objective"]),
         "outer": -1,
-        "wdq": wq.detach().clone(),
-        "A": init_a.detach().clone(),
-        "B": init_b.detach().clone(),
+        "wdq": step1_baseline["wq"].detach().clone(),
+        "A": step1_baseline["A"].detach().clone(),
+        "B": step1_baseline["B"].detach().clone(),
     }
 
     append_jsonl(
@@ -413,59 +550,15 @@ def optimize_layer(
         {
             "layer": key,
             "outer": -1,
-            "phase": "init_svd",
-            "objective_weighted": float(init_obj),
+            "phase": "init",
+            "objective_weighted": float(step1_baseline["objective"]),
             "bits": bits,
             "group_size": gs,
             "rank_ab": int(args.rank_ab),
             "qtype": args.qtype,
-            "init_source": init_source,
-            "lam_a": float(args.lam_a),
-            "lam_b": float(args.lam_b),
-            "wq_frozen": True,
+            "init_source": "step1_artifact",
         },
     )
-
-    def _record_iter(step_idx: int, a_cur: torch.Tensor, b_cur: torch.Tensor) -> None:
-        nonlocal best
-        obj = weighted_objective(w, wq, a_cur, b_cur, d)
-        phase = "als_init" if step_idx < 0 else "als"
-        append_jsonl(
-            metrics_path,
-            {
-                "layer": key,
-                "outer": int(step_idx),
-                "phase": phase,
-                "objective_weighted": float(obj),
-                "bits": bits,
-                "group_size": gs,
-                "rank_ab": int(args.rank_ab),
-                "qtype": args.qtype,
-                "lam_a": float(args.lam_a),
-                "lam_b": float(args.lam_b),
-                "wq_frozen": True,
-            },
-        )
-        if obj < best["objective"]:
-            best = {
-                "objective": float(obj),
-                "outer": int(step_idx),
-                "wdq": wq.detach().clone(),
-                "A": a_cur.detach().clone(),
-                "B": b_cur.detach().clone(),
-            }
-
-    a, b, als_meta = weighted_ridge_ab_als(
-        residual=residual,
-        diag_weight=d,
-        rank=int(args.rank_ab),
-        eps=float(args.eps),
-        n_iters=int(args.outer_loops),
-        lam_a=float(args.lam_a),
-        lam_b=float(args.lam_b),
-        metrics_cb=_record_iter,
-    )
-    final_obj = weighted_objective(w, wq, a, b, d)
 
     final_quant_meta = {
         "bits": bits,
@@ -473,13 +566,55 @@ def optimize_layer(
         "clip_percentile": float(clip_pct),
         "qtype": str(args.qtype),
         "init_source": str(init_source),
-        "wq_frozen": True,
-        "solver": "ridge_als_ab",
-        "lam_a": float(args.lam_a),
-        "lam_b": float(args.lam_b),
-        "als_iters": int(args.outer_loops),
     }
 
+    for outer in range(int(args.outer_loops)):
+        a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
+        target = w - (a @ b)
+        wq, codebook, qcodes, quant_meta = soft_refine_then_project(
+            target=target,
+            init_codebook=codebook,
+            init_qcodes=qcodes,
+            diag_weight=d,
+            soft_steps=int(args.soft_steps),
+            soft_lr=float(args.soft_lr),
+            soft_tau=float(args.soft_tau),
+            init_logit_abs=float(args.soft_init_logit),
+            logit_clip=float(args.soft_logit_clip),
+            scale_lr=float(args.soft_scale_lr),
+            allow_codebook_update=not bool(args.soft_fixed_codebook),
+        )
+        a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
+        final_quant_meta = dict(quant_meta)
+        final_quant_meta["qtype"] = str(args.qtype)
+        final_quant_meta["clip_percentile"] = float(clip_pct)
+        obj = weighted_objective(w, wq, a, b, d)
+
+        append_jsonl(
+            metrics_path,
+            {
+                "layer": key,
+                "outer": int(outer),
+                "phase": "alternating",
+                "objective_weighted": float(obj),
+                "bits": bits,
+                "group_size": gs,
+                "rank_ab": int(args.rank_ab),
+                "qtype": args.qtype,
+            },
+        )
+
+        if obj < best["objective"]:
+            best = {
+                "objective": float(obj),
+                "outer": int(outer),
+                "wdq": wq.detach().clone(),
+                "A": a.detach().clone(),
+                "B": b.detach().clone(),
+            }
+
+    a, b = weighted_low_rank_fit(w - wq, d, rank=int(args.rank_ab), eps=float(args.eps))
+    final_obj = weighted_objective(w, wq, a, b, d)
     return {
         "wdq": wq.detach().to(torch.float16).cpu(),
         "low_rank_ab": {
@@ -487,15 +622,10 @@ def optimize_layer(
             "B": b.detach().to(torch.float16).cpu(),
             "meta": {
                 "rank": int(args.rank_ab),
-                "rank_effective": int(als_meta["rank_effective"]),
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
                 "objective_weighted_final": float(final_obj),
-                "lam_a": float(args.lam_a),
-                "lam_b": float(args.lam_b),
-                "wq_frozen": True,
-                "solver": "ridge_als_ab",
             },
         },
         "wdq_best": best["wdq"].detach().to(torch.float16).cpu(),
@@ -504,16 +634,11 @@ def optimize_layer(
             "B": best["B"].detach().to(torch.float16).cpu(),
             "meta": {
                 "rank": int(args.rank_ab),
-                "rank_effective": int(als_meta["rank_effective"]),
                 "bits": bits,
                 "group_size": gs,
                 "qtype": str(args.qtype),
                 "best_outer": int(best["outer"]),
                 "objective_weighted_best": float(best["objective"]),
-                "lam_a": float(args.lam_a),
-                "lam_b": float(args.lam_b),
-                "wq_frozen": True,
-                "solver": "ridge_als_ab",
             },
         },
         "codebook": codebook.detach().to(torch.float16).cpu(),
@@ -527,15 +652,12 @@ def optimize_layer(
             "objective_weighted_final": float(final_obj),
             "objective_weighted_best": float(best["objective"]),
             "best_outer": int(best["outer"]),
-            "lam_a": float(args.lam_a),
-            "lam_b": float(args.lam_b),
-            "wq_frozen": True,
         },
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("Step3 1-bit Ridge ALS - Freeze Wq, Alternate A/B")
+    ap = argparse.ArgumentParser("Alt Step3 - Alternating Lloyd-Max + Low-Rank Compensation")
     ap.add_argument("--model_id", required=True)
     ap.add_argument("--revision", default=None)
     ap.add_argument("--trust_remote_code", action="store_true")
@@ -550,13 +672,18 @@ def main() -> None:
 
     ap.add_argument("--qtype", default="hessian-aware", choices=["plain", "hessian-aware"])
     ap.add_argument("--rank_ab", type=int, default=64)
-    ap.add_argument("--outer_loops", type=int, default=10, help="Number of A/B ridge-ALS iterations")
+    ap.add_argument("--outer_loops", type=int, default=4)
     ap.add_argument("--lloyd_iter", type=int, default=12)
     ap.add_argument("--chunk_groups", type=int, default=4096)
     ap.add_argument("--clip_percentile", type=float, default=None)
+    ap.add_argument("--soft_steps", type=int, default=25)
+    ap.add_argument("--soft_lr", type=float, default=1e-1)
+    ap.add_argument("--soft_scale_lr", type=float, default=5e-2)
+    ap.add_argument("--soft_tau", type=float, default=1.0)
+    ap.add_argument("--soft_init_logit", type=float, default=4.0)
+    ap.add_argument("--soft_logit_clip", type=float, default=8.0)
+    ap.add_argument("--soft_fixed_codebook", action="store_true")
     ap.add_argument("--eps", type=float, default=1e-8)
-    ap.add_argument("--lam_a", type=float, default=1e-4)
-    ap.add_argument("--lam_b", type=float, default=1e-4)
     ap.add_argument("--layer_regex", type=str, default=None)
     ap.add_argument("--max_layers", type=int, default=0)
     ap.add_argument("--save_every_layer", action="store_true")
@@ -589,7 +716,7 @@ def main() -> None:
 
     t0 = time.time()
     for idx, key in enumerate(ctx["keys"], start=1):
-        print(f"[Step3-1bit-Ridge] ({idx}/{len(ctx['keys'])}) optimizing: {key}", flush=True)
+        print(f"[Alt-Step3] ({idx}/{len(ctx['keys'])}) optimizing: {key}", flush=True)
         layer_res = optimize_layer(key=key, ctx=ctx, args=args, metrics_path=metrics_path)
         wdq_out[key] = layer_res["wdq"]
         ab_out[key] = layer_res["low_rank_ab"]
@@ -638,8 +765,6 @@ def main() -> None:
         "lloyd_iter": int(args.lloyd_iter),
         "chunk_groups": int(args.chunk_groups),
         "clip_percentile_override": args.clip_percentile,
-        "lam_a": float(args.lam_a),
-        "lam_b": float(args.lam_b),
         "num_layers": len(layer_summaries),
         "objective_weighted_final_mean": float(final_mean),
         "objective_weighted_best_mean": float(best_mean),
@@ -650,7 +775,7 @@ def main() -> None:
         with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("[Step3-1bit-Ridge] saved:", flush=True)
+    print("[Alt-Step3] saved:", flush=True)
     print(f"  wdq*: {out_dir / 'wdq_star.pt'}", flush=True)
     print(f"  AB*:  {out_dir / 'low_rank_ab.pt'}", flush=True)
     if args.save_all:
@@ -685,7 +810,7 @@ def _invoke_local_main(argv: Sequence[str]) -> subprocess.CompletedProcess:
 
 
 @dataclass
-class Step31BitRidgeConfig:
+class Step03AlternatingConfig:
     model_id: str
     step1_dir: str
     calib_s: str
@@ -697,13 +822,18 @@ class Step31BitRidgeConfig:
     dtype_w: str = "fp16"
     qtype: str = "hessian-aware"
     rank_ab: int = 64
-    outer_loops: int = 10
+    outer_loops: int = 4
     lloyd_iter: int = 12
     chunk_groups: int = 4096
     clip_percentile: Optional[float] = None
+    soft_steps: int = 25
+    soft_lr: float = 1e-1
+    soft_scale_lr: float = 5e-2
+    soft_tau: float = 1.0
+    soft_init_logit: float = 4.0
+    soft_logit_clip: float = 8.0
+    soft_fixed_codebook: bool = False
     eps: float = 1e-8
-    lam_a: float = 1e-4
-    lam_b: float = 1e-4
     layer_regex: Optional[str] = None
     max_layers: int = 0
     save_every_layer: bool = False
@@ -713,7 +843,7 @@ class Step31BitRidgeConfig:
     source_script: str = str(Path(__file__).resolve())
 
 
-def build_command(cfg: Step31BitRidgeConfig) -> List[str]:
+def build_command(cfg: Step03AlternatingConfig) -> List[str]:
     cmd: List[str] = [
         str(cfg.python_exe),
         str(cfg.source_script),
@@ -741,12 +871,20 @@ def build_command(cfg: Step31BitRidgeConfig) -> List[str]:
         str(int(cfg.lloyd_iter)),
         "--chunk_groups",
         str(int(cfg.chunk_groups)),
+        "--soft_steps",
+        str(int(cfg.soft_steps)),
+        "--soft_lr",
+        str(float(cfg.soft_lr)),
+        "--soft_scale_lr",
+        str(float(cfg.soft_scale_lr)),
+        "--soft_tau",
+        str(float(cfg.soft_tau)),
+        "--soft_init_logit",
+        str(float(cfg.soft_init_logit)),
+        "--soft_logit_clip",
+        str(float(cfg.soft_logit_clip)),
         "--eps",
         str(float(cfg.eps)),
-        "--lam_a",
-        str(float(cfg.lam_a)),
-        "--lam_b",
-        str(float(cfg.lam_b)),
         "--max_layers",
         str(int(cfg.max_layers)),
         "--seed",
@@ -762,12 +900,14 @@ def build_command(cfg: Step31BitRidgeConfig) -> List[str]:
         cmd += ["--layer_regex", str(cfg.layer_regex)]
     if cfg.save_every_layer:
         cmd.append("--save_every_layer")
+    if cfg.soft_fixed_codebook:
+        cmd.append("--soft_fixed_codebook")
     if cfg.save_all:
         cmd.append("--save_all")
     return cmd
 
 
-def run(cfg: Step31BitRidgeConfig, check: bool = True) -> subprocess.CompletedProcess:
+def run(cfg: Step03AlternatingConfig, check: bool = True) -> subprocess.CompletedProcess:
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
     cp = _invoke_local_main(build_command(cfg)[2:])
     if check and cp.returncode != 0:

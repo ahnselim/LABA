@@ -52,10 +52,12 @@ def _disable_flash_attn_package():
         return
     orig = _tf_import_utils._is_package_available
 
-    def _patched(package: str):
+    def _patched(package: str, *args, **kwargs):
         if package == "flash_attn":
+            if kwargs.get("return_version"):
+                return False, "N/A"
             return False
-        return orig(package)
+        return orig(package, *args, **kwargs)
 
     _tf_import_utils._is_package_available = _patched
     setattr(_tf_import_utils, sentinel, True)
@@ -479,7 +481,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         revision=args.revision,
-        torch_dtype=dtype if (dtype in (torch.float16, torch.bfloat16)) else None,
+        dtype=dtype if (dtype in (torch.float16, torch.bfloat16)) else None,
         device_map=args.device_map,
         trust_remote_code=args.trust_remote_code,
     )

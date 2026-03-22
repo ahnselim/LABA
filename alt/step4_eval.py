@@ -18,19 +18,19 @@ Outputs:
   - console metrics
   - optional JSON summary
 
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=2 \
 python step4_eval.py \
   --model_name meta-llama/Llama-3.1-8B \
-  --wdq_star_path ./output/llama3_8b_64/step3_alt/1bit_reg/wdq_star.pt \
-  --low_rank_ab_path ./output/llama3_8b_64/step3_alt/1bit_reg/low_rank_ab.pt \
+  --wdq_star_path ./output/llama3_8b_64/step3_alt/1bit_nll/wdq_star_best.pt \
+  --low_rank_ab_path ./output/llama3_8b_64/step3_alt/1bit_nll/low_rank_ab_best.pt \
   --device cuda:0 \
   --compare_wdq_only
   
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=3 \
 python step4_eval.py \
   --model_name Qwen/Qwen3-8B \
-  --wdq_star_path ./output/qwen3_8b_64/step3_alt/1bit_reg/wdq_star.pt \
-  --low_rank_ab_path ./output/qwen3_8b_64/step3_alt/1bit_reg/low_rank_ab.pt \
+  --wdq_star_path ./output/qwen3_8b_64/step3_alt/1bit_nll/wdq_star_best.pt \
+  --low_rank_ab_path ./output/qwen3_8b_64/step3_alt/1bit_nll/low_rank_ab_best.pt \
   --device cuda:0 \
   --compare_wdq_only \
   --trust_remote_code

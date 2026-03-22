@@ -13,11 +13,20 @@ Output layout:
     summaries/bit{b}.json
 
 Example:
-CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=2 \
   python utils/prebake_from_alternating.py \
     --out_root ./output/llama_3_8/output_step0_prebake_alt \
-    --step3 2=./output/llama3_8b/step3_alt/2bit_100 \
+    --step3 1=./output/llama3_8b_64/step3_alt/1bit_nll \
+    --metric best \
     --step3 4=./output/llama3_8b/step3_alt/4bit_50 
+
+CUDA_VISIBLE_DEVICES=3 \
+  python utils/prebake_from_alternating.py \
+    --out_root ./output/qwen3_8b_64/output_step0_prebake_alt \
+    --step3 1=./output/qwen3_8b_64/step3_1bit_ridge \
+    --step3 2=./output/qwen3_8b_64/step3_alt/2bit_100 \
+    --step3 3=./output/qwen3_8b_64/step3_alt/3bit_50 \
+    --step3 4=./output/qwen3_8b_64/step3_alt/4bit_50 
     
 CUDA_VISIBLE_DEVICES=1 \
   python utils/prebake_from_alternating.py \
@@ -40,8 +49,18 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
-WDQ_ARTIFACT = "wdq_star.pt"
-AB_ARTIFACT = "low_rank_ab.pt"
+ARTIFACT_VARIANTS = {
+    "plain": {
+        "wdq": "wdq_star.pt",
+        "ab": "low_rank_ab.pt",
+        "source": "step_3_alternating:final",
+    },
+    "best": {
+        "wdq": "wdq_star_best.pt",
+        "ab": "low_rank_ab_best.pt",
+        "source": "step_3_alternating:best",
+    },
+}
 
 
 def _safe_name(s: object) -> str:
@@ -174,6 +193,7 @@ class ExportSpec:
 class ExportConfig:
     out_root: str
     step3_specs: Tuple[ExportSpec, ...]
+    metric: str = "plain"
     copy_raw: bool = False
 
 
@@ -202,10 +222,12 @@ def export_prebake_from_alternating(
     step3_dir: Path,
     out_root: Path,
     explicit_bit: Optional[int] = None,
+    metric: str = "plain",
     copy_raw: bool = False,
 ) -> dict:
-    wdq_path = step3_dir / WDQ_ARTIFACT
-    ab_path = step3_dir / AB_ARTIFACT
+    artifacts = ARTIFACT_VARIANTS[str(metric)]
+    wdq_path = step3_dir / artifacts["wdq"]
+    ab_path = step3_dir / artifacts["ab"]
     quant_meta_path = step3_dir / "quant_meta_star.pt"
     summary_path = step3_dir / "summary.json"
 
@@ -266,7 +288,7 @@ def export_prebake_from_alternating(
             merged_meta.update(qmeta)
         if isinstance(rec_meta, dict):
             merged_meta.update(rec_meta)
-        merged_meta["which"] = "final"
+        merged_meta["which"] = str(metric)
         merged_meta["step3_dir"] = str(step3_dir)
 
         qmode = str(merged_meta.get("qtype", "alternating"))
@@ -284,7 +306,7 @@ def export_prebake_from_alternating(
             "meta": {
                 "bit": int(bit),
                 "variant": "alt-step3-alternating",
-                "source": "step_3_alternating:final",
+                "source": artifacts["source"],
                 "qmode": qmode,
                 "group_size": (None if group_size is None else int(group_size)),
                 "step3_meta": merged_meta,
@@ -308,6 +330,7 @@ def export_prebake_from_alternating(
         "saved": int(saved),
         "skipped_missing_ab": int(skipped_missing_ab),
         "mismatched_shapes": int(mismatched_shapes),
+        "metric": str(metric),
         "copy_raw": bool(copy_raw),
         "raw_paths": raw_paths,
         "qmodes": sorted(qtypes),
@@ -348,6 +371,7 @@ def run(cfg: ExportConfig) -> Dict[str, str]:
             step3_dir=spec.step3_dir,
             out_root=out_root,
             explicit_bit=spec.bit,
+            metric=cfg.metric,
             copy_raw=bool(cfg.copy_raw),
         )
         bit = int(result["bit"])
@@ -366,11 +390,12 @@ def run(cfg: ExportConfig) -> Dict[str, str]:
         "created": int(time.time()),
         "copy_raw": bool(cfg.copy_raw),
         "artifacts": {
-            "wdq": WDQ_ARTIFACT,
-            "ab": AB_ARTIFACT,
+            "metric": str(cfg.metric),
+            "wdq": ARTIFACT_VARIANTS[str(cfg.metric)]["wdq"],
+            "ab": ARTIFACT_VARIANTS[str(cfg.metric)]["ab"],
         },
         "bit_to_step3_dir": step3_mapping,
-        "note": "LABA/alt/step_3_alternating wdq_star/low_rank_ab outputs exported in step0 prebake-compatible per-module format.",
+        "note": "LABA/alt/step_3_alternating outputs exported in step0 prebake-compatible per-module format.",
     }
     _write_json(out_root / "meta.json", meta)
 
@@ -398,11 +423,18 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> ExportConfig:
         action="append",
         help="Repeatable items in the form BIT=/path/to/step3_out or /path/to/step3_out.",
     )
+    ap.add_argument(
+        "--metric",
+        default="plain",
+        choices=sorted(ARTIFACT_VARIANTS.keys()),
+        help="Which step3 snapshot to export: plain=final artifacts, best=best-selected artifacts.",
+    )
     ap.add_argument("--copy_raw", action="store_true")
     ns = ap.parse_args(argv)
     return ExportConfig(
         out_root=str(ns.out_root),
         step3_specs=_flatten_step3_args(ns.step3),
+        metric=str(ns.metric),
         copy_raw=bool(ns.copy_raw),
     )
 
